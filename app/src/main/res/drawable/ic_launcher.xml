@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Sfondo Circolare Nero AMOLED con bordo antracite -->
+    <path
+        android:fillColor="#0A0A0A"
+        android:strokeColor="#2C2C2C"
+        android:strokeWidth="3"
+        android:pathData="M54,4 A50,50 0 1,1 53.9,4 Z" />
+
+    <!-- Linee Guida Orizzontali Bianche (Stile Video Spritz) -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.8"
+        android:strokeLineCap="round"
+        android:pathData="M20,34 L46,34 M62,34 L88,34 M20,74 L88,74" />
+
+    <!-- Mirino Circolare Superiore -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.8"
+        android:pathData="M54,27 A7,7 0 1,1 53.9,27 Z" />
+
+    <!-- Tacca Rossa Inferiore -->
+    <path
+        android:strokeColor="#E53935"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M54,68 L54,74" />
+
+    <!-- Lettera Centrale "S" / Barra ORP Rossa -->
+    <path
+        android:strokeColor="#E53935"
+        android:strokeWidth="5.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M61,44 C61,40 47,40 47,46 C47,52 61,54 61,61 C61,67 47,67 47,62" />
+</vector>
