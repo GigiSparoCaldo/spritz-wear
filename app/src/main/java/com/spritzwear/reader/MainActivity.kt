@@ -2,6 +2,8 @@ package com.spritzwear.reader
 
 import android.content.Context
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.HapticFeedbackConstants
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,6 +24,8 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SwipeVertical
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -48,11 +52,13 @@ import androidx.wear.compose.material.CircularProgressIndicator
 import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import kotlin.math.abs
 
 enum class CrownControlSetting {
@@ -60,6 +66,12 @@ enum class CrownControlSetting {
     ALWAYS_WPM,  // La corona cambia sempre i WPM
     ALWAYS_SCRUB // La corona scorre sempre le parole
 }
+
+private data class WordSpan(
+    val globalIndex: Int,
+    val startChar: Int,
+    val endChar: Int
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,6 +95,8 @@ fun SpritzReaderApp() {
     var wordIndex by remember { mutableIntStateOf(prefs.getInt("saved_index_${currentBook.id}", 0)) }
     var wpm by remember { mutableIntStateOf(prefs.getInt("saved_wpm", 300)) }
     var isPlaying by remember { mutableStateOf(false) }
+    var isTtsEnabled by remember { mutableStateOf(false) }
+    var isTtsReady by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var crownSetting by remember { mutableStateOf(CrownControlSetting.AUTO_SMART) }
     var showLibraryDialog by remember { mutableStateOf(false) }
@@ -91,7 +105,61 @@ fun SpritzReaderApp() {
     var rotaryAccumulator by remember { mutableFloatStateOf(0f) }
     val focusRequester = remember { FocusRequester() }
 
-    // Modalità effettiva della corona in questo istante
+    // Riferimento all'istanza TextToSpeech e mappa della frase attualmente in pronuncia
+    var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
+    val currentChunkSpans = remember { mutableStateListOf<WordSpan>() }
+    var currentUtteranceDone by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
+    var rangeCallbackTriggered by remember { mutableStateOf(false) }
+
+    // Inizializzazione TextToSpeech di sistema
+    DisposableEffect(context) {
+        var engine: TextToSpeech? = null
+        engine = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                engine?.language = Locale.ITALIAN
+                engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+
+                    // Chiamato da Wear OS mentre pronuncia ogni singola parola della frase
+                    override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
+                        rangeCallbackTriggered = true
+                        val matched = currentChunkSpans.firstOrNull { span ->
+                            start in span.startChar..span.endChar || span.startChar in start..end
+                        }
+                        if (matched != null) {
+                            wordIndex = matched.globalIndex
+                        }
+                    }
+
+                    override fun onDone(utteranceId: String?) {
+                        currentUtteranceDone?.complete(Unit)
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        currentUtteranceDone?.complete(Unit)
+                    }
+                })
+                ttsEngine = engine
+                isTtsReady = true
+            }
+        }
+        onDispose {
+            engine?.stop()
+            engine?.shutdown()
+        }
+    }
+
+    // Imposta automaticamente la lingua del TTS (Italiano o Inglese) quando cambia il libro
+    LaunchedEffect(currentBook, isTtsReady) {
+        if (isTtsReady) {
+            val sampleText = currentBook.words.take(40).joinToString(" ").lowercase()
+            val englishMarkers = listOf(" the ", " and ", " with ", " delivers ", " flashes ")
+            val isEnglish = englishMarkers.count { sampleText.contains(it) } >= 2
+            ttsEngine?.language = if (isEnglish) Locale.US else Locale.ITALIAN
+        }
+    }
+
     val activeCrownIsWpm = when (crownSetting) {
         CrownControlSetting.AUTO_SMART -> isPlaying
         CrownControlSetting.ALWAYS_WPM -> true
@@ -102,6 +170,7 @@ fun SpritzReaderApp() {
         scope.launch {
             isLoading = true
             isPlaying = false
+            ttsEngine?.stop()
             val loaded = withContext(Dispatchers.IO) { BookParser.parseFile(file) }
             currentBook = loaded
             wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
@@ -116,13 +185,14 @@ fun SpritzReaderApp() {
         uri?.let {
             scope.launch {
                 isLoading = true
+                isPlaying = false
+                ttsEngine?.stop()
                 val name = it.lastPathSegment?.substringAfterLast('/') ?: "Libro.epub"
                 val loaded = withContext(Dispatchers.IO) {
                     BookParser.importUriToInternalStorage(context, it, name)
                 }
                 currentBook = loaded
                 wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
-                isPlaying = false
                 isLoading = false
                 showLibraryDialog = false
             }
@@ -136,23 +206,96 @@ fun SpritzReaderApp() {
             .apply()
     }
 
-    // Motore RSVP Spritz con Soft-Start e micro-pause sulla punteggiatura
-    LaunchedEffect(isPlaying, wordIndex, wpm, currentBook) {
-        if (isPlaying) {
-            if (wordIndex >= currentBook.words.lastIndex) {
-                isPlaying = false
-                return@LaunchedEffect
-            }
-            val currentRawWord = currentBook.words[wordIndex]
-            val spritz = BookParser.toSpritzWord(currentRawWord)
-            val ramp = (0.6f + (wordsReadInSession.coerceAtMost(12) / 12f) * 0.4f)
-            val delayMs = BookParser.calculateDelayMs(wpm, spritz.delayMultiplier, ramp)
-
-            delay(delayMs)
-            wordIndex = (wordIndex + 1).coerceAtMost(currentBook.words.lastIndex)
-            wordsReadInSession++
-        } else {
+    // Motore Duale: Visivo Puro (RSVP) oppure Ibrido Voce TTS + Spritz
+    LaunchedEffect(isPlaying, isTtsEnabled, currentBook) {
+        if (!isPlaying) {
+            ttsEngine?.stop()
+            currentUtteranceDone?.complete(Unit)
             wordsReadInSession = 0
+            return@LaunchedEffect
+        }
+
+        if (isTtsEnabled && isTtsReady && ttsEngine != null) {
+            // MODALITÀ IBRIDA TTS + SPRITZ
+            while (isPlaying && wordIndex <= currentBook.words.lastIndex) {
+                val startIdx = wordIndex
+                val spans = mutableListOf<WordSpan>()
+                val sb = StringBuilder()
+                var idx = startIdx
+
+                // Costruisce una frase naturale (fino a 18 parole o fino a un segno di fine frase)
+                while (idx <= currentBook.words.lastIndex && spans.size < 18) {
+                    val w = currentBook.words[idx]
+                    val s = sb.length
+                    sb.append(w)
+                    val e = sb.length
+                    spans.add(WordSpan(idx, s, e))
+                    sb.append(" ")
+                    idx++
+                    if (w.endsWith(".") || w.endsWith("!") || w.endsWith("?") || w.endsWith(";")) {
+                        break
+                    }
+                }
+
+                currentChunkSpans.clear()
+                currentChunkSpans.addAll(spans)
+                rangeCallbackTriggered = false
+
+                // Converte i WPM scelti con la corona in velocità vocale (180 WPM = 1.0x)
+                val speechRate = (wpm / 180f).coerceIn(0.5f, 3.0f)
+                ttsEngine?.setSpeechRate(speechRate)
+
+                val doneDeferred = CompletableDeferred<Unit>()
+                currentUtteranceDone = doneDeferred
+
+                ttsEngine?.speak(
+                    sb.toString().trim(),
+                    TextToSpeech.QUEUE_FLUSH,
+                    null,
+                    "SPRITZ_UTTERANCE_$startIdx"
+                )
+
+                // Avanzamento sincronizzato: usa onRangeStart se supportato dalla voce,
+                // altrimenti avanza con il timer calcolato fino al completamento della frase
+                for (span in spans) {
+                    if (!isPlaying || doneDeferred.isCompleted) break
+                    if (!rangeCallbackTriggered) {
+                        wordIndex = span.globalIndex
+                    }
+                    val spritz = BookParser.toSpritzWord(currentBook.words[span.globalIndex])
+                    val effectiveTtsWpm = (180f * speechRate).toInt()
+                    val stepDelay = BookParser.calculateDelayMs(effectiveTtsWpm, spritz.delayMultiplier)
+                    delay(stepDelay)
+                }
+
+                // Attende che il motore vocale finisca la frase prima di passare alla successiva
+                doneDeferred.await()
+
+                if (isPlaying) {
+                    val nextIdx = spans.last().globalIndex + 1
+                    if (nextIdx <= currentBook.words.lastIndex) {
+                        wordIndex = nextIdx
+                    } else {
+                        isPlaying = false
+                    }
+                }
+            }
+        } else {
+            // MODALITÀ VISIVA PURA ULTRA-VELOCE (100 - 1000 WPM)
+            while (isPlaying && wordIndex <= currentBook.words.lastIndex) {
+                val currentRawWord = currentBook.words[wordIndex]
+                val spritz = BookParser.toSpritzWord(currentRawWord)
+                val ramp = (0.6f + (wordsReadInSession.coerceAtMost(12) / 12f) * 0.4f)
+                val delayMs = BookParser.calculateDelayMs(wpm, spritz.delayMultiplier, ramp)
+
+                delay(delayMs)
+                if (wordIndex < currentBook.words.lastIndex) {
+                    wordIndex++
+                    wordsReadInSession++
+                } else {
+                    isPlaying = false
+                }
+            }
         }
     }
 
@@ -180,6 +323,7 @@ fun SpritzReaderApp() {
         LibraryScreen(
             onSelectFile = { file -> loadFileAsync(file) },
             onSelectDemo = {
+                ttsEngine?.stop()
                 currentBook = BookParser.getDemoBook()
                 wordIndex = 0
                 isPlaying = false
@@ -218,8 +362,12 @@ fun SpritzReaderApp() {
 
                     if (activeCrownIsWpm) {
                         wpm = (wpm + steps * 10).coerceIn(100, 1000)
+                        if (isTtsEnabled && isPlaying) {
+                            ttsEngine?.setSpeechRate((wpm / 180f).coerceIn(0.5f, 3.0f))
+                        }
                     } else {
                         isPlaying = false
+                        ttsEngine?.stop()
                         wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
                     }
                 }
@@ -232,7 +380,7 @@ fun SpritzReaderApp() {
         CircularProgressIndicator(
             progress = progress,
             modifier = Modifier.fillMaxSize().padding(3.dp),
-            indicatorColor = Color(0xFFD32F2F),
+            indicatorColor = if (isTtsEnabled) Color(0xFF4CAF50) else Color(0xFFD32F2F),
             trackColor = Color(0xFF1E1E1E),
             strokeWidth = 3.dp
         )
@@ -244,7 +392,7 @@ fun SpritzReaderApp() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Intestazione: Titolo + Capitolo, WPM e Minuti rimasti
+            // Intestazione: Titolo + Capitolo, WPM (o Velocità Voce) e Minuti rimasti
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
                     text = currentBook.title,
@@ -255,14 +403,20 @@ fun SpritzReaderApp() {
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                val speedInfo = if (isTtsEnabled) {
+                    val rate = String.format(Locale.US, "%.1fx", (wpm / 180f).coerceIn(0.5f, 3.0f))
+                    "VOCE $rate ($wpm WPM)"
+                } else {
+                    "$wpm WPM"
+                }
                 Text(
-                    text = "Cap.$currentChapterNum • $wpm WPM • -${remainingMinutes}m",
-                    color = Color(0xFF9E9E9E),
+                    text = "Cap.$currentChapterNum • $speedInfo • -${remainingMinutes}m",
+                    color = if (isTtsEnabled) Color(0xFF81C784) else Color(0xFF9E9E9E),
                     fontSize = 10.sp
                 )
             }
 
-            // Mirino Spritz Centrale con Ridimensionamento Dinamico e Contesto in Pausa
+            // Mirino Spritz Centrale fedele al layout del video
             SpritzReticleStage(
                 words = currentBook.words,
                 wordIndex = wordIndex,
@@ -273,7 +427,7 @@ fun SpritzReaderApp() {
                 }
             )
 
-            // Controlli Inferiori: Badge Corona + Salto Capitoli + Play/Pausa + Libreria
+            // Controlli Inferiori: Badge Corona + Libreria + Capitoli + Play/Pausa + Toggle Voce TTS
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -316,7 +470,7 @@ fun SpritzReaderApp() {
                 }
 
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     SmallCircleButton(
@@ -324,6 +478,7 @@ fun SpritzReaderApp() {
                         contentDesc = "Libreria",
                         onClick = {
                             isPlaying = false
+                            ttsEngine?.stop()
                             showLibraryDialog = true
                         }
                     )
@@ -333,6 +488,7 @@ fun SpritzReaderApp() {
                         contentDesc = "Capitolo Precedente",
                         onClick = {
                             isPlaying = false
+                            ttsEngine?.stop()
                             val prevChap = currentBook.chapterIndices.lastOrNull { it < wordIndex - 5 } ?: 0
                             wordIndex = prevChap
                         }
@@ -342,7 +498,7 @@ fun SpritzReaderApp() {
                         modifier = Modifier
                             .size(34.dp)
                             .clip(CircleShape)
-                            .background(Color(0xFFD32F2F))
+                            .background(if (isTtsEnabled) Color(0xFF2E7D32) else Color(0xFFD32F2F))
                             .clickable {
                                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                                 if (wordIndex >= currentBook.words.lastIndex) wordIndex = 0
@@ -363,11 +519,35 @@ fun SpritzReaderApp() {
                         contentDesc = "Capitolo Successivo",
                         onClick = {
                             isPlaying = false
+                            ttsEngine?.stop()
                             val nextChap = currentBook.chapterIndices.firstOrNull { it > wordIndex }
                                 ?: currentBook.words.lastIndex
                             wordIndex = nextChap
                         }
                     )
+
+                    // Pulsante Toggle TTS (Passa da Solo Visivo a Ibrido Voce + Spritz)
+                    Box(
+                        modifier = Modifier
+                            .size(26.dp)
+                            .clip(CircleShape)
+                            .background(if (isTtsEnabled) Color(0xFF1B5E20) else Color(0xFF262626))
+                            .clickable {
+                                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                                isTtsEnabled = !isTtsEnabled
+                                if (!isTtsEnabled) {
+                                    ttsEngine?.stop()
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isTtsEnabled) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                            contentDescription = "Attiva/Disattiva Voce TTS",
+                            tint = if (isTtsEnabled) Color(0xFF81C784) else Color.White,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
                 }
             }
         }
@@ -384,7 +564,6 @@ fun SpritzReticleStage(
     val word = words.getOrElse(wordIndex) { "" }
     val spritz = remember(word) { BookParser.toSpritzWord(word) }
 
-    // Scala dinamicamente il font per le parole italiane molto lunghe
     val dynamicFontSize = when {
         word.length <= 9 -> 24.sp
         word.length in 10..13 -> 20.sp
@@ -492,7 +671,7 @@ fun SpritzReticleStage(
             )
         }
 
-        // Chicca UX: Anteprima del contesto della frase quando il lettore è in Pausa
+        // Contesto della frase visibile quando in Pausa
         if (!isPlaying && words.isNotEmpty()) {
             val startCtx = (wordIndex - 4).coerceAtLeast(0)
             val endCtx = (wordIndex + 4).coerceAtMost(words.lastIndex)
@@ -585,7 +764,6 @@ fun LibraryScreen(
             fontWeight = FontWeight.Bold
         )
 
-        // Pulsante Caricamento Wi-Fi dal telefono/PC
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -620,7 +798,6 @@ fun LibraryScreen(
             }
         }
 
-        // Elenco dei libri caricati nella memoria dell'orologio
         savedFiles.take(2).forEach { file ->
             Box(
                 modifier = Modifier
