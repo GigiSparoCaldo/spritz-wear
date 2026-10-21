@@ -2,6 +2,7 @@ package com.spritzwear.reader
 
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -13,6 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -22,14 +24,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.FolderOpen
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.SwipeVertical
 import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.DoNotDisturbOn
@@ -41,9 +41,12 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -55,6 +58,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.CircularProgressIndicator
@@ -62,26 +66,40 @@ import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.abs
 
-enum class CrownControlSetting {
-    AUTO_SMART,  // Play -> cambia WPM | Pausa -> scorre le parole
-    ALWAYS_WPM,  // La corona cambia sempre i WPM
-    ALWAYS_SCRUB // La corona scorre sempre le parole
+enum class ActiveScreen {
+    READER,
+    CHAPTER_LIST,
+    LIBRARY
 }
 
 class MainActivity : ComponentActivity() {
+
+    /**
+     * Forza la configurazione Android di questa Activity a 320 DPI (xhdpi, density = 2.0f),
+     * annullando l'override digitale a 240 DPI impostato nel sistema.
+     */
+    override fun attachBaseContext(newBase: Context) {
+        val config = Configuration(newBase.resources.configuration)
+        config.densityDpi = 320
+        config.fontScale = 1.0f
+        val context320 = newBase.createConfigurationContext(config)
+        super.attachBaseContext(context320)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Crea subito le cartelle /sdcard/SpritzBooks all'avvio
         BookParser.getDedicatedFolders(this)
         setContent {
-            MaterialTheme {
-                SpritzReaderApp()
+            // Blocca anche il motore Jetpack Compose esattamente a 320 DPI (320 / 160 = 2.0f)
+            CompositionLocalProvider(LocalDensity provides Density(density = 2.0f, fontScale = 1.0f)) {
+                MaterialTheme {
+                    SpritzReaderApp()
+                }
             }
         }
     }
@@ -96,32 +114,21 @@ fun SpritzReaderApp() {
 
     var currentBook by remember { mutableStateOf(BookParser.getDemoBook()) }
     var wordIndex by remember { mutableIntStateOf(prefs.getInt("saved_index_${currentBook.id}", 0)) }
-    var wpm by remember { mutableIntStateOf(prefs.getInt("saved_wpm", 300)) }
     var isVibrationEnabled by remember { mutableStateOf(prefs.getBoolean("saved_haptic", true)) }
-    var isPlaying by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
-    var crownSetting by remember { mutableStateOf(CrownControlSetting.AUTO_SMART) }
-    var showLibraryDialog by remember { mutableStateOf(false) }
+    var activeScreen by remember { mutableStateOf(ActiveScreen.READER) }
 
-    var wordsReadInSession by remember { mutableIntStateOf(0) }
     var rotaryAccumulator by remember { mutableFloatStateOf(0f) }
     val focusRequester = remember { FocusRequester() }
-
-    val activeCrownIsWpm = when (crownSetting) {
-        CrownControlSetting.AUTO_SMART -> isPlaying
-        CrownControlSetting.ALWAYS_WPM -> true
-        CrownControlSetting.ALWAYS_SCRUB -> false
-    }
 
     val loadFileAsync: (File) -> Unit = { file ->
         scope.launch {
             isLoading = true
-            isPlaying = false
-            val loaded = withContext(Dispatchers.IO) { BookParser.parseFile(file) }
+            val loaded = withContext(Dispatchers.IO) { BookParser.parseFile(context, file) }
             currentBook = loaded
             wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
             isLoading = false
-            showLibraryDialog = false
+            activeScreen = ActiveScreen.READER
         }
     }
 
@@ -131,7 +138,6 @@ fun SpritzReaderApp() {
         uri?.let {
             scope.launch {
                 isLoading = true
-                isPlaying = false
                 val name = it.lastPathSegment?.substringAfterLast('/') ?: "Libro.epub"
                 val loaded = withContext(Dispatchers.IO) {
                     BookParser.importUriToInternalStorage(context, it, name)
@@ -139,41 +145,22 @@ fun SpritzReaderApp() {
                 currentBook = loaded
                 wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
                 isLoading = false
-                showLibraryDialog = false
+                activeScreen = ActiveScreen.READER
             }
         }
     }
 
-    LaunchedEffect(wordIndex, wpm, currentBook.id, isVibrationEnabled) {
+    // Salva automaticamente posizione, totale parole e stato vibrazione
+    LaunchedEffect(wordIndex, currentBook.id, isVibrationEnabled) {
         prefs.edit()
             .putInt("saved_index_${currentBook.id}", wordIndex)
-            .putInt("saved_wpm", wpm)
+            .putInt("saved_total_${currentBook.id}", currentBook.words.size)
             .putBoolean("saved_haptic", isVibrationEnabled)
             .apply()
     }
 
-    // Loop di lettura rapida RSVP Spritz
-    LaunchedEffect(isPlaying, wordIndex, wpm, currentBook) {
-        if (isPlaying) {
-            if (wordIndex >= currentBook.words.lastIndex) {
-                isPlaying = false
-                return@LaunchedEffect
-            }
-            val currentRawWord = currentBook.words[wordIndex]
-            val spritz = BookParser.toSpritzWord(currentRawWord)
-            val ramp = (0.6f + (wordsReadInSession.coerceAtMost(12) / 12f) * 0.4f)
-            val delayMs = BookParser.calculateDelayMs(wpm, spritz.delayMultiplier, ramp)
-
-            delay(delayMs)
-            wordIndex = (wordIndex + 1).coerceAtMost(currentBook.words.lastIndex)
-            wordsReadInSession++
-        } else {
-            wordsReadInSession = 0
-        }
-    }
-
-    LaunchedEffect(showLibraryDialog, isLoading) {
-        if (!showLibraryDialog && !isLoading) {
+    LaunchedEffect(activeScreen, isLoading) {
+        if (activeScreen == ActiveScreen.READER && !isLoading) {
             focusRequester.requestFocus()
         }
     }
@@ -185,40 +172,62 @@ fun SpritzReaderApp() {
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator(indicatorColor = Color(0xFFE53935))
-                Spacer(modifier = Modifier.height(6.dp))
-                Text("Caricamento...", color = Color.White, fontSize = 11.sp)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Apertura libro...", color = Color.White, fontSize = 12.sp)
             }
         }
         return
     }
 
-    if (showLibraryDialog) {
-        LibraryScreen(
-            onSelectFile = { file -> loadFileAsync(file) },
-            onSelectDemo = {
-                currentBook = BookParser.getDemoBook()
-                wordIndex = 0
-                isPlaying = false
-                showLibraryDialog = false
-            },
-            onOpenSystemPicker = {
-                try {
-                    filePickerLauncher.launch(arrayOf("text/plain", "application/epub+zip", "*/*"))
-                } catch (_: Exception) {
-                }
-            },
-            onClose = { showLibraryDialog = false }
-        )
-        return
+    when (activeScreen) {
+        ActiveScreen.CHAPTER_LIST -> {
+            ChapterListScreen(
+                book = currentBook,
+                currentWordIndex = wordIndex,
+                isVibrationEnabled = isVibrationEnabled,
+                onSelectChapter = { chapter ->
+                    wordIndex = chapter.startWordIndex.coerceIn(0, currentBook.words.lastIndex)
+                    activeScreen = ActiveScreen.READER
+                },
+                onClose = { activeScreen = ActiveScreen.READER }
+            )
+            return
+        }
+
+        ActiveScreen.LIBRARY -> {
+            LibraryScreen(
+                onSelectFile = { file -> loadFileAsync(file) },
+                onSelectDemo = {
+                    currentBook = BookParser.getDemoBook()
+                    wordIndex = prefs.getInt("saved_index_${currentBook.id}", 0)
+                        .coerceIn(0, currentBook.words.lastIndex)
+                    activeScreen = ActiveScreen.READER
+                },
+                onOpenSystemPicker = {
+                    runCatching {
+                        filePickerLauncher.launch(arrayOf("text/plain", "application/epub+zip", "*/*"))
+                    }
+                },
+                onClose = { activeScreen = ActiveScreen.READER }
+            )
+            return
+        }
+
+        ActiveScreen.READER -> Unit
     }
 
-    val progress = if (currentBook.words.size > 1) {
-        wordIndex.toFloat() / (currentBook.words.size - 1).toFloat()
-    } else 1f
-
-    val remainingWords = (currentBook.words.size - 1 - wordIndex).coerceAtLeast(0)
-    val remainingMinutes = (remainingWords.toFloat() / wpm.toFloat()).toInt()
-    val currentChapterNum = currentBook.chapterIndices.count { it <= wordIndex }.coerceAtLeast(1)
+    // Calcola il capitolo attuale e la percentuale di completamento del singolo capitolo
+    val currentChapterIndex = currentBook.chapters
+        .indexOfLast { wordIndex >= it.startWordIndex }
+        .coerceAtLeast(0)
+    val currentChapter = currentBook.chapters.getOrElse(currentChapterIndex) {
+        ChapterInfo("Capitolo 1", 0, currentBook.words.lastIndex)
+    }
+    val chapterTotalWords = (currentChapter.endWordIndex - currentChapter.startWordIndex).coerceAtLeast(1)
+    val chapterDoneWords = (wordIndex - currentChapter.startWordIndex).coerceAtLeast(0)
+    val chapterPercent = ((chapterDoneWords.toFloat() / chapterTotalWords.toFloat()) * 100f)
+        .toInt()
+        .coerceIn(0, 100)
 
     Box(
         modifier = Modifier
@@ -231,17 +240,11 @@ fun SpritzReaderApp() {
                     val steps = (rotaryAccumulator / threshold).toInt()
                     rotaryAccumulator %= threshold
 
-                    // Vibrazione Corona attivabile/disattivabile dall'utente
                     if (isVibrationEnabled) {
                         view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     }
 
-                    if (activeCrownIsWpm) {
-                        wpm = (wpm + steps * 10).coerceIn(100, 1000)
-                    } else {
-                        isPlaying = false
-                        wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
-                    }
+                    wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
                 }
                 true
             }
@@ -249,263 +252,184 @@ fun SpritzReaderApp() {
             .focusable(),
         contentAlignment = Alignment.Center
     ) {
-        CircularProgressIndicator(
-            progress = progress,
-            modifier = Modifier.fillMaxSize().padding(2.dp),
-            indicatorColor = Color(0xFFD32F2F),
-            trackColor = Color(0xFF1A1A1A),
-            strokeWidth = 2.5.dp
-        )
-
-        // Layout calibrato per 240 DPI: massimizza la larghezza centrale sul quadrante rotondo
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 6.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp, vertical = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Intestazione compatta
+            // INTESTAZIONE CLICCABILE: Toccando qui si apre la lista dei capitoli
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(horizontal = 24.dp)
+                modifier = Modifier
+                    .padding(horizontal = 20.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF141414))
+                    .clickable {
+                        if (isVibrationEnabled) {
+                            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                        }
+                        activeScreen = ActiveScreen.CHAPTER_LIST
+                    }
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
             ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = currentChapter.title,
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "Scegli Capitolo",
+                        tint = Color(0xFFE53935),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
                 Text(
-                    text = currentBook.title,
-                    color = Color.White,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 0.8.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = "Cap.$currentChapterNum • $wpm WPM • -${remainingMinutes}m",
+                    text = "Capitolo al $chapterPercent% • (${ currentChapterIndex + 1 }/${ currentBook.chapters.size })",
                     color = Color(0xFF9E9E9E),
-                    fontSize = 9.sp,
+                    fontSize = 9.5.sp,
                     maxLines = 1
                 )
             }
 
-            // Mirino Spritz con Centratura Dinamica Anti-Taglio su Canvas
+            // MIRINO SPRITZ CENTRALE CON PAROLA E CONTESTO SOTTOSTANTE
             SpritzReticleStage(
                 words = currentBook.words,
-                wordIndex = wordIndex,
-                isPlaying = isPlaying,
-                onTogglePlay = {
-                    if (isVibrationEnabled) {
-                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                    }
-                    isPlaying = !isPlaying
-                }
+                wordIndex = wordIndex
             )
 
-            // Barra inferiore con Toggle Modalità Corona + 5 controlli (incluso Vibrazione On/Off)
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(3.dp)
+            // BARRA CONTROLLI INFERIORE (Libreria | Cap. Prec | Cap. Succ | Vibrazione Corona)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(bottom = 2.dp)
             ) {
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(
-                            if (activeCrownIsWpm) Color(0xFF3E1818) else Color(0xFF1A2936)
-                        )
-                        .clickable {
-                            if (isVibrationEnabled) {
-                                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                            }
-                            crownSetting = when (crownSetting) {
-                                CrownControlSetting.AUTO_SMART -> CrownControlSetting.ALWAYS_WPM
-                                CrownControlSetting.ALWAYS_WPM -> CrownControlSetting.ALWAYS_SCRUB
-                                CrownControlSetting.ALWAYS_SCRUB -> CrownControlSetting.AUTO_SMART
-                            }
+                SmallCircleButton(
+                    icon = Icons.Default.FolderOpen,
+                    contentDesc = "Libreria EPUB/TXT",
+                    onClick = { activeScreen = ActiveScreen.LIBRARY }
+                )
+
+                SmallCircleButton(
+                    icon = Icons.Default.SkipPrevious,
+                    contentDesc = "Capitolo Precedente",
+                    onClick = {
+                        val prevIdx = if (wordIndex > currentChapter.startWordIndex + 3) {
+                            currentChapter.startWordIndex
+                        } else {
+                            currentBook.chapters.getOrNull(currentChapterIndex - 1)?.startWordIndex ?: 0
                         }
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        wordIndex = prevIdx
+                    }
+                )
+
+                SmallCircleButton(
+                    icon = Icons.Default.SkipNext,
+                    contentDesc = "Capitolo Successivo",
+                    onClick = {
+                        val nextIdx = currentBook.chapters.getOrNull(currentChapterIndex + 1)?.startWordIndex
+                            ?: currentBook.words.lastIndex
+                        wordIndex = nextIdx
+                    }
+                )
+
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(if (isVibrationEnabled) Color(0xFF1E3A2F) else Color(0xFF262626))
+                        .clickable {
+                            isVibrationEnabled = !isVibrationEnabled
+                            if (isVibrationEnabled) {
+                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                            }
+                        },
+                    contentAlignment = Alignment.Center
                 ) {
                     Icon(
-                        imageVector = if (activeCrownIsWpm) Icons.Default.Speed else Icons.Default.SwipeVertical,
-                        contentDescription = "Modalità Corona",
-                        tint = if (activeCrownIsWpm) Color(0xFFFF5252) else Color(0xFF64B5F6),
-                        modifier = Modifier.size(10.dp)
+                        imageVector = if (isVibrationEnabled) Icons.Default.Vibration else Icons.Outlined.DoNotDisturbOn,
+                        contentDescription = "Vibrazione Corona On/Off",
+                        tint = if (isVibrationEnabled) Color(0xFF81C784) else Color(0xFF757575),
+                        modifier = Modifier.size(15.dp)
                     )
-                    val modeLabel = when (crownSetting) {
-                        CrownControlSetting.AUTO_SMART -> if (isPlaying) "AUTO: WPM" else "AUTO: PAROLE"
-                        CrownControlSetting.ALWAYS_WPM -> "FISSO: WPM"
-                        CrownControlSetting.ALWAYS_SCRUB -> "FISSO: PAROLE"
-                    }
-                    Text(
-                        text = modeLabel,
-                        color = Color.White,
-                        fontSize = 8.5.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // 1. Libreria (Cartella SpritzBooks)
-                    SmallCircleButton(
-                        icon = Icons.Default.FolderOpen,
-                        contentDesc = "Cartella SpritzBooks",
-                        onClick = {
-                            isPlaying = false
-                            showLibraryDialog = true
-                        }
-                    )
-
-                    // 2. Capitolo Precedente
-                    SmallCircleButton(
-                        icon = Icons.Default.SkipPrevious,
-                        contentDesc = "Capitolo Precedente",
-                        onClick = {
-                            isPlaying = false
-                            val prevChap = currentBook.chapterIndices.lastOrNull { it < wordIndex - 5 } ?: 0
-                            wordIndex = prevChap
-                        }
-                    )
-
-                    // 3. Play / Pausa
-                    Box(
-                        modifier = Modifier
-                            .size(30.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFFD32F2F))
-                            .clickable {
-                                if (isVibrationEnabled) {
-                                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                                }
-                                if (wordIndex >= currentBook.words.lastIndex) wordIndex = 0
-                                isPlaying = !isPlaying
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = "Play/Pausa",
-                            tint = Color.White,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-
-                    // 4. Capitolo Successivo
-                    SmallCircleButton(
-                        icon = Icons.Default.SkipNext,
-                        contentDesc = "Capitolo Successivo",
-                        onClick = {
-                            isPlaying = false
-                            val nextChap = currentBook.chapterIndices.firstOrNull { it > wordIndex }
-                                ?: currentBook.words.lastIndex
-                            wordIndex = nextChap
-                        }
-                    )
-
-                    // 5. Toggle Vibrazione Corona On / Off
-                    Box(
-                        modifier = Modifier
-                            .size(24.dp)
-                            .clip(CircleShape)
-                            .background(if (isVibrationEnabled) Color(0xFF1E3A2F) else Color(0xFF262626))
-                            .clickable {
-                                isVibrationEnabled = !isVibrationEnabled
-                                if (isVibrationEnabled) {
-                                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = if (isVibrationEnabled) Icons.Default.Vibration else Icons.Outlined.DoNotDisturbOn,
-                            contentDescription = "Vibrazione Corona On/Off",
-                            tint = if (isVibrationEnabled) Color(0xFF81C784) else Color(0xFF757575),
-                            modifier = Modifier.size(13.dp)
-                        )
-                    }
                 }
             }
         }
     }
 }
 
-/**
- * Motore di rendering Spritz su Canvas calibrato per 240 DPI:
- * - Disegna l'intera parola su un unico livello anziché in 3 colonne separate.
- * - Posiziona la lettera rossa (ORP) esattamente sotto il mirino circolare.
- * - Se una parola è molto lunga e il suffisso rischia di uscire a destra o a sinistra,
- *   riduce automaticamente la dimensione in sp e applica uno shift morbido verso il centro
- *   così il 100% delle lettere è sempre visibile e leggibile.
- */
 @Composable
 fun SpritzReticleStage(
     words: List<String>,
-    wordIndex: Int,
-    isPlaying: Boolean,
-    onTogglePlay: () -> Unit
+    wordIndex: Int
 ) {
     val word = words.getOrElse(wordIndex) { "" }
     val spritz = remember(word) { BookParser.toSpritzWord(word) }
     val textMeasurer = rememberTextMeasurer()
 
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onTogglePlay() },
+        modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 1. Barra superiore con mirino circolare centrale (fedele al video)
+        // 1. Barra superiore con mirino circolare centrale
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp)
-                .height(12.dp)
+                .padding(horizontal = 10.dp)
+                .height(13.dp)
         ) {
             val centerY = size.height / 2f
             val centerX = size.width / 2f
-            val circleRadius = 4.dp.toPx()
+            val circleRadius = 4.5.dp.toPx()
 
             drawLine(
                 color = Color.White,
                 start = Offset(0f, centerY),
                 end = Offset(centerX - circleRadius, centerY),
-                strokeWidth = 1.25.dp.toPx()
+                strokeWidth = 1.4.dp.toPx()
             )
             drawCircle(
                 color = Color.White,
                 radius = circleRadius,
                 center = Offset(centerX, centerY),
-                style = Stroke(width = 1.25.dp.toPx())
+                style = Stroke(width = 1.4.dp.toPx())
             )
             drawLine(
                 color = Color.White,
                 start = Offset(centerX + circleRadius, centerY),
                 end = Offset(size.width, centerY),
-                strokeWidth = 1.25.dp.toPx()
+                strokeWidth = 1.4.dp.toPx()
             )
         }
 
-        // 2. Canvas centrale della parola con auto-fit e allineamento ORP
+        // 2. Parola su Canvas a 320 DPI nativi con centratura ORP e anti-taglio
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(34.dp)
+                .height(38.dp)
         ) {
             if (word.isEmpty()) return@Canvas
 
-            val safePadding = 6.dp.toPx()
+            val safePadding = 8.dp.toPx()
             val availableWidth = size.width - (safePadding * 2f)
             val centerX = size.width / 2f
 
-            // Scala base per 240 DPI
             var fontSizeSp = when {
-                word.length <= 8 -> 22f
-                word.length in 9..11 -> 19f
-                word.length in 12..14 -> 16.5f
-                word.length in 15..18 -> 14.5f
-                else -> 12.5f
+                word.length <= 8 -> 24f
+                word.length in 9..11 -> 21f
+                word.length in 12..14 -> 18f
+                word.length in 15..18 -> 15.5f
+                else -> 13.5f
             }
 
             val annotatedWord = buildAnnotatedString {
@@ -530,7 +454,6 @@ fun SpritzReticleStage(
                 maxLines = 1
             )
 
-            // Se la parola intera è ancora più larga dello schermo disponibile, riduce il font finché entra
             while (layoutResult.size.width > availableWidth && fontSizeSp > 10f) {
                 fontSizeSp -= 1f
                 layoutResult = textMeasurer.measure(
@@ -544,16 +467,12 @@ fun SpritzReticleStage(
                 )
             }
 
-            // Calcola la posizione esatta del centro della lettera rossa (ORP)
             val pivotCharIndex = spritz.prefix.length
             val pivotBox = layoutResult.getBoundingBox(pivotCharIndex)
             val pivotCenterInText = (pivotBox.left + pivotBox.right) / 2f
 
-            // Posizione ideale: il centro della lettera rossa cade sotto il mirino (centerX)
             var drawX = centerX - pivotCenterInText
 
-            // Protezione anti-taglio: se una parola lunghissima sporge a destra o a sinistra,
-            // la fa scorrere quel tanto che basta per non tagliare nessuna lettera
             val rightEdge = drawX + layoutResult.size.width
             if (rightEdge > size.width - safePadding) {
                 drawX -= (rightEdge - (size.width - safePadding))
@@ -574,8 +493,8 @@ fun SpritzReticleStage(
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp)
-                .height(8.dp)
+                .padding(horizontal = 10.dp)
+                .height(9.dp)
         ) {
             val centerY = size.height / 2f
             val centerX = size.width / 2f
@@ -583,18 +502,18 @@ fun SpritzReticleStage(
                 color = Color.White,
                 start = Offset(0f, centerY),
                 end = Offset(size.width, centerY),
-                strokeWidth = 1.25.dp.toPx()
+                strokeWidth = 1.4.dp.toPx()
             )
             drawLine(
                 color = Color(0xFFE53935),
-                start = Offset(centerX, centerY - 3.dp.toPx()),
+                start = Offset(centerX, centerY - 3.5.dp.toPx()),
                 end = Offset(centerX, centerY),
-                strokeWidth = 1.25.dp.toPx()
+                strokeWidth = 1.4.dp.toPx()
             )
         }
 
-        // Contesto della frase visibile in Pausa
-        if (!isPlaying && words.isNotEmpty()) {
+        // Anteprima del contesto della frase intorno alla parola attiva
+        if (words.isNotEmpty()) {
             val startCtx = (wordIndex - 3).coerceAtLeast(0)
             val endCtx = (wordIndex + 3).coerceAtMost(words.lastIndex)
             val annotatedContext = buildAnnotatedString {
@@ -612,16 +531,115 @@ fun SpritzReticleStage(
             }
             Text(
                 text = annotatedContext,
-                fontSize = 8.5.sp,
+                fontSize = 9.5.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 1.dp, start = 14.dp, end = 14.dp)
+                    .padding(top = 3.dp, start = 14.dp, end = 14.dp)
             )
-        } else {
-            Spacer(modifier = Modifier.height(12.dp))
+        }
+    }
+}
+
+/**
+ * Schermata di selezione dei Capitoli quando si clicca sul titolo in alto.
+ */
+@Composable
+fun ChapterListScreen(
+    book: BookItem,
+    currentWordIndex: Int,
+    isVibrationEnabled: Boolean,
+    onSelectChapter: (ChapterInfo) -> Unit,
+    onClose: () -> Unit
+) {
+    val view = LocalView.current
+    val scrollState = rememberScrollState()
+    val focusRequester = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .onRotaryScrollEvent { event ->
+                scope.launch {
+                    scrollState.scrollBy(event.verticalScrollPixels)
+                }
+                if (isVibrationEnabled) {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                }
+                true
+            }
+            .focusRequester(focusRequester)
+            .focusable()
+            .verticalScroll(scrollState)
+            .padding(horizontal = 20.dp, vertical = 18.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = "CAPITOLI (${book.chapters.size})",
+            color = Color(0xFFE53935),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
+
+        book.chapters.forEachIndexed { idx, chapter ->
+            val isCurrent = currentWordIndex in chapter.startWordIndex..chapter.endWordIndex
+            val chapPercent = when {
+                currentWordIndex > chapter.endWordIndex -> 100
+                currentWordIndex < chapter.startWordIndex -> 0
+                else -> {
+                    val total = (chapter.endWordIndex - chapter.startWordIndex).coerceAtLeast(1)
+                    val done = (currentWordIndex - chapter.startWordIndex).coerceAtLeast(0)
+                    ((done.toFloat() / total.toFloat()) * 100f).toInt().coerceIn(0, 100)
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (isCurrent) Color(0xFF3E1818) else Color(0xFF1E1E1E))
+                    .clickable { onSelectChapter(chapter) }
+                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "${idx + 1}. ${chapter.title}",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "$chapPercent%",
+                    color = if (isCurrent) Color(0xFFFF8A80) else Color(0xFF9E9E9E),
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .padding(top = 4.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color(0xFF2C2C2C))
+                .clickable { onClose() }
+                .padding(horizontal = 14.dp, vertical = 5.dp)
+        ) {
+            Text("Chiudi", color = Color.White, fontSize = 10.sp)
         }
     }
 }
@@ -634,7 +652,7 @@ fun SmallCircleButton(
 ) {
     Box(
         modifier = Modifier
-            .size(24.dp)
+            .size(28.dp)
             .clip(CircleShape)
             .background(Color(0xFF262626))
             .clickable { onClick() },
@@ -644,11 +662,14 @@ fun SmallCircleButton(
             imageVector = icon,
             contentDescription = contentDesc,
             tint = Color.White,
-            modifier = Modifier.size(13.dp)
+            modifier = Modifier.size(15.dp)
         )
     }
 }
 
+/**
+ * Schermata Libreria con miniatura Copertina EPUB e Percentuale di Completamento affiancata.
+ */
 @Composable
 fun LibraryScreen(
     onSelectFile: (File) -> Unit,
@@ -657,7 +678,12 @@ fun LibraryScreen(
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
-    var savedFiles by remember { mutableStateOf(BookParser.scanBooksFolders(context)) }
+    val scope = rememberCoroutineScope()
+    val scrollState = rememberScrollState()
+    val focusRequester = remember { FocusRequester() }
+
+    var summaries by remember { mutableStateOf<List<BookSummary>>(emptyList()) }
+    var isScanning by remember { mutableStateOf(true) }
     var wifiUrl by remember { mutableStateOf<String?>(null) }
     var hasAllFilesPermission by remember {
         mutableStateOf(
@@ -666,9 +692,21 @@ fun LibraryScreen(
         )
     }
 
+    val refreshLibrary: () -> Unit = {
+        scope.launch {
+            isScanning = true
+            summaries = withContext(Dispatchers.IO) { BookParser.getBookSummaries(context) }
+            isScanning = false
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        refreshLibrary()
+    }
+
     val wifiServer = remember {
         WifiBookServer(context) { uploadedFile ->
-            savedFiles = BookParser.scanBooksFolders(context)
             onSelectFile(uploadedFile)
         }
     }
@@ -681,20 +719,26 @@ fun LibraryScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .verticalScroll(rememberScrollState())
+            .onRotaryScrollEvent { event ->
+                scope.launch { scrollState.scrollBy(event.verticalScrollPixels) }
+                true
+            }
+            .focusRequester(focusRequester)
+            .focusable()
+            .verticalScroll(scrollState)
             .padding(horizontal = 18.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(5.dp, Alignment.CenterVertically)
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         Text(
-            text = "CARTELLA: /sdcard/SpritzBooks",
+            text = "LIBRERIA SPRITZBOOKS",
             color = Color(0xFFE53935),
-            fontSize = 9.5.sp,
+            fontSize = 10.5.sp,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center
         )
 
-        // Pulsante per scansionare subito la cartella /sdcard/SpritzBooks
+        // Pulsante Scansione / Permesso /sdcard/SpritzBooks
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -719,9 +763,9 @@ fun LibraryScreen(
                             }
                         }
                     }
-                    savedFiles = BookParser.scanBooksFolders(context)
+                    refreshLibrary()
                 }
-                .padding(vertical = 5.dp, horizontal = 8.dp),
+                .padding(vertical = 6.dp, horizontal = 8.dp),
             contentAlignment = Alignment.Center
         ) {
             Row(
@@ -732,11 +776,11 @@ fun LibraryScreen(
                     imageVector = Icons.Default.Refresh,
                     contentDescription = "Scansiona",
                     tint = Color(0xFF64B5F6),
-                    modifier = Modifier.size(12.dp)
+                    modifier = Modifier.size(13.dp)
                 )
                 Text(
-                    text = if (hasAllFilesPermission) "Scansiona SpritzBooks (${savedFiles.size})"
-                    else "Abilita Lettura /SpritzBooks",
+                    text = if (hasAllFilesPermission) "Scansiona /SpritzBooks (${summaries.size})"
+                    else "Abilita Permesso /SpritzBooks",
                     color = Color.White,
                     fontSize = 9.5.sp,
                     fontWeight = FontWeight.SemiBold
@@ -744,32 +788,75 @@ fun LibraryScreen(
             }
         }
 
-        // Elenco di tutti i file .epub / .txt trovati nella cartella SpritzBooks
-        if (savedFiles.isEmpty()) {
+        // Lista dei Libri con Copertina e Percentuale di Completamento
+        if (isScanning) {
+            Text("Lettura copertine...", color = Color.Gray, fontSize = 9.5.sp)
+        } else if (summaries.isEmpty()) {
             Text(
-                text = "Nessun file in /sdcard/SpritzBooks",
+                text = "Copia i tuoi .epub o .txt in /sdcard/SpritzBooks",
                 color = Color.Gray,
-                fontSize = 8.5.sp,
+                fontSize = 9.sp,
                 textAlign = TextAlign.Center
             )
         } else {
-            savedFiles.forEach { file ->
-                Box(
+            summaries.forEach { item ->
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFF1F1F1F))
-                        .clickable { onSelectFile(file) }
-                        .padding(vertical = 5.dp, horizontal = 8.dp),
-                    contentAlignment = Alignment.Center
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFF1C1C1C))
+                        .clickable { onSelectFile(item.file) }
+                        .padding(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(
-                        text = file.name,
-                        color = Color.White,
-                        fontSize = 9.5.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    // Copertina Libro EPUB (o icona libro se .txt / privo di copertina)
+                    if (item.coverBitmap != null) {
+                        Image(
+                            bitmap = item.coverBitmap.asImageBitmap(),
+                            contentDescription = item.displayTitle,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(width = 28.dp, height = 38.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(width = 28.dp, height = 38.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color(0xFF332020)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Book,
+                                contentDescription = null,
+                                tint = Color(0xFFE53935),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+
+                    // Titolo + Percentuale di completamento
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = item.displayTitle,
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "Completato: ${item.completionPercent}%",
+                            color = if (item.completionPercent > 0) Color(0xFF81C784) else Color(0xFF9E9E9E),
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
             }
         }
@@ -786,7 +873,7 @@ fun LibraryScreen(
                         null
                     }
                 }
-                .padding(vertical = 5.dp, horizontal = 8.dp),
+                .padding(vertical = 6.dp, horizontal = 8.dp),
             contentAlignment = Alignment.Center
         ) {
             Row(
@@ -797,10 +884,10 @@ fun LibraryScreen(
                     imageVector = Icons.Default.Wifi,
                     contentDescription = "Wi-Fi",
                     tint = Color(0xFF81C784),
-                    modifier = Modifier.size(12.dp)
+                    modifier = Modifier.size(13.dp)
                 )
                 Text(
-                    text = wifiUrl ?: "Invia via Wi-Fi in SpritzBooks",
+                    text = wifiUrl ?: "Carica via Wi-Fi",
                     color = Color.White,
                     fontSize = 9.5.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -815,9 +902,9 @@ fun LibraryScreen(
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color(0xFF1E2A38))
                     .clickable { onOpenSystemPicker() }
-                    .padding(horizontal = 7.dp, vertical = 4.dp)
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
             ) {
-                Text("Sfoglia", color = Color.White, fontSize = 9.sp)
+                Text("Sfoglia", color = Color.White, fontSize = 9.5.sp)
             }
 
             Box(
@@ -825,9 +912,9 @@ fun LibraryScreen(
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color(0xFF2A2A2A))
                     .clickable { onSelectDemo() }
-                    .padding(horizontal = 7.dp, vertical = 4.dp)
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
             ) {
-                Text("Demo", color = Color.LightGray, fontSize = 9.sp)
+                Text("Demo", color = Color.LightGray, fontSize = 9.5.sp)
             }
 
             Box(
@@ -835,9 +922,9 @@ fun LibraryScreen(
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color(0xFF3E1818))
                     .clickable { onClose() }
-                    .padding(horizontal = 7.dp, vertical = 4.dp)
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
             ) {
-                Text("Chiudi", color = Color.White, fontSize = 9.sp)
+                Text("Chiudi", color = Color.White, fontSize = 9.5.sp)
             }
         }
     }
