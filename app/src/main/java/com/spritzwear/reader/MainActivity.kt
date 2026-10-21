@@ -18,9 +18,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SwipeVertical
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,22 +35,30 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.CircularProgressIndicator
 import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import kotlin.math.abs
 
-enum class CrownMode {
-    WPM_SPEED,   // La corona modifica la velocità in WPM
-    WORD_SCRUB   // La corona fa girare le parole avanti e indietro
+enum class CrownControlSetting {
+    AUTO_SMART,  // Play -> cambia WPM | Pausa -> scorre le parole
+    ALWAYS_WPM,  // La corona cambia sempre i WPM
+    ALWAYS_SCRUB // La corona scorre sempre le parole
 }
 
 class MainActivity : ComponentActivity() {
@@ -66,35 +76,59 @@ class MainActivity : ComponentActivity() {
 fun SpritzReaderApp() {
     val context = LocalContext.current
     val view = LocalView.current
+    val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("spritz_prefs", Context.MODE_PRIVATE) }
 
     var currentBook by remember { mutableStateOf(BookParser.getDemoBook()) }
     var wordIndex by remember { mutableIntStateOf(prefs.getInt("saved_index_${currentBook.id}", 0)) }
     var wpm by remember { mutableIntStateOf(prefs.getInt("saved_wpm", 300)) }
     var isPlaying by remember { mutableStateOf(false) }
-    var crownMode by remember { mutableStateOf(CrownMode.WORD_SCRUB) }
+    var isLoading by remember { mutableStateOf(false) }
+    var crownSetting by remember { mutableStateOf(CrownControlSetting.AUTO_SMART) }
     var showLibraryDialog by remember { mutableStateOf(false) }
 
-    // Contatore per il Soft-Start (accelerazione graduale nelle prime 12 parole)
     var wordsReadInSession by remember { mutableIntStateOf(0) }
     var rotaryAccumulator by remember { mutableFloatStateOf(0f) }
     val focusRequester = remember { FocusRequester() }
 
-    // File Picker di sistema per caricare file .txt o .epub
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let {
-            val name = it.lastPathSegment?.substringAfterLast('/') ?: "Libro.epub"
-            val loaded = BookParser.parseUri(context, it, name)
+    // Modalità effettiva della corona in questo istante
+    val activeCrownIsWpm = when (crownSetting) {
+        CrownControlSetting.AUTO_SMART -> isPlaying
+        CrownControlSetting.ALWAYS_WPM -> true
+        CrownControlSetting.ALWAYS_SCRUB -> false
+    }
+
+    val loadFileAsync: (File) -> Unit = { file ->
+        scope.launch {
+            isLoading = true
+            isPlaying = false
+            val loaded = withContext(Dispatchers.IO) { BookParser.parseFile(file) }
             currentBook = loaded
             wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
-            isPlaying = false
+            isLoading = false
             showLibraryDialog = false
         }
     }
 
-    // Salva automaticamente progresso e WPM
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let {
+            scope.launch {
+                isLoading = true
+                val name = it.lastPathSegment?.substringAfterLast('/') ?: "Libro.epub"
+                val loaded = withContext(Dispatchers.IO) {
+                    BookParser.importUriToInternalStorage(context, it, name)
+                }
+                currentBook = loaded
+                wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
+                isPlaying = false
+                isLoading = false
+                showLibraryDialog = false
+            }
+        }
+    }
+
     LaunchedEffect(wordIndex, wpm, currentBook.id) {
         prefs.edit()
             .putInt("saved_index_${currentBook.id}", wordIndex)
@@ -102,7 +136,7 @@ fun SpritzReaderApp() {
             .apply()
     }
 
-    // Loop principale del motore RSVP Spritz
+    // Motore RSVP Spritz con Soft-Start e micro-pause sulla punteggiatura
     LaunchedEffect(isPlaying, wordIndex, wpm, currentBook) {
         if (isPlaying) {
             if (wordIndex >= currentBook.words.lastIndex) {
@@ -111,8 +145,6 @@ fun SpritzReaderApp() {
             }
             val currentRawWord = currentBook.words[wordIndex]
             val spritz = BookParser.toSpritzWord(currentRawWord)
-
-            // Soft-start: parte dal 60% e sale al 100% entro 12 parole
             val ramp = (0.6f + (wordsReadInSession.coerceAtMost(12) / 12f) * 0.4f)
             val delayMs = BookParser.calculateDelayMs(wpm, spritz.delayMultiplier, ramp)
 
@@ -124,22 +156,40 @@ fun SpritzReaderApp() {
         }
     }
 
-    LaunchedEffect(showLibraryDialog) {
-        if (!showLibraryDialog) {
+    LaunchedEffect(showLibraryDialog, isLoading) {
+        if (!showLibraryDialog && !isLoading) {
             focusRequester.requestFocus()
         }
     }
 
+    if (isLoading) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(indicatorColor = Color(0xFFE53935))
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Apertura libro...", color = Color.White, fontSize = 12.sp)
+            }
+        }
+        return
+    }
+
     if (showLibraryDialog) {
         LibraryScreen(
-            onSelectBook = { book ->
-                currentBook = book
-                wordIndex = prefs.getInt("saved_index_${book.id}", 0).coerceIn(0, book.words.lastIndex)
+            onSelectFile = { file -> loadFileAsync(file) },
+            onSelectDemo = {
+                currentBook = BookParser.getDemoBook()
+                wordIndex = 0
                 isPlaying = false
                 showLibraryDialog = false
             },
             onOpenSystemPicker = {
-                filePickerLauncher.launch(arrayOf("text/plain", "application/epub+zip", "*/*"))
+                try {
+                    filePickerLauncher.launch(arrayOf("text/plain", "application/epub+zip", "*/*"))
+                } catch (_: Exception) {
+                }
             },
             onClose = { showLibraryDialog = false }
         )
@@ -152,6 +202,7 @@ fun SpritzReaderApp() {
 
     val remainingWords = (currentBook.words.size - 1 - wordIndex).coerceAtLeast(0)
     val remainingMinutes = (remainingWords.toFloat() / wpm.toFloat()).toInt()
+    val currentChapterNum = currentBook.chapterIndices.count { it <= wordIndex }.coerceAtLeast(1)
 
     Box(
         modifier = Modifier
@@ -159,24 +210,17 @@ fun SpritzReaderApp() {
             .background(Color.Black)
             .onRotaryScrollEvent { event ->
                 rotaryAccumulator += event.verticalScrollPixels
-                val threshold = 32f // Sensibilità scatto corona OnePlus Watch 3
+                val threshold = 30f
                 if (abs(rotaryAccumulator) >= threshold) {
                     val steps = (rotaryAccumulator / threshold).toInt()
                     rotaryAccumulator %= threshold
-
-                    // Feedback aptico ad ogni scatto della corona
                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
 
-                    when (crownMode) {
-                        CrownMode.WORD_SCRUB -> {
-                            // Modalità Scrub: la corona fa girare le parole avanti e indietro
-                            isPlaying = false
-                            wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
-                        }
-                        CrownMode.WPM_SPEED -> {
-                            // Modalità WPM: la corona cambia la velocità di lettura
-                            wpm = (wpm + steps * 10).coerceIn(100, 1000)
-                        }
+                    if (activeCrownIsWpm) {
+                        wpm = (wpm + steps * 10).coerceIn(100, 1000)
+                    } else {
+                        isPlaying = false
+                        wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
                     }
                 }
                 true
@@ -185,12 +229,9 @@ fun SpritzReaderApp() {
             .focusable(),
         contentAlignment = Alignment.Center
     ) {
-        // Bordo circolare perimetrale di avanzamento sul display rotondo
         CircularProgressIndicator(
             progress = progress,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(3.dp),
+            modifier = Modifier.fillMaxSize().padding(3.dp),
             indicatorColor = Color(0xFFD32F2F),
             trackColor = Color(0xFF1E1E1E),
             strokeWidth = 3.dp
@@ -203,83 +244,97 @@ fun SpritzReaderApp() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Intestazione superiore: Titolo ("HEADLINE") + Statistiche WPM / Tempo rimasto
+            // Intestazione: Titolo + Capitolo, WPM e Minuti rimasti
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
                     text = currentBook.title,
                     color = Color.White,
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.2.sp,
+                    letterSpacing = 1.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "$wpm WPM • ${wordIndex + 1}/${currentBook.words.size} (-${remainingMinutes}m)",
+                    text = "Cap.$currentChapterNum • $wpm WPM • -${remainingMinutes}m",
                     color = Color(0xFF9E9E9E),
                     fontSize = 10.sp
                 )
             }
 
-            // Box Centrale Spritz (Mirino circolare + Guide orizzontali + Parola allineata su ORP)
+            // Mirino Spritz Centrale con Ridimensionamento Dinamico e Contesto in Pausa
             SpritzReticleStage(
-                word = currentBook.words.getOrElse(wordIndex) { "" },
+                words = currentBook.words,
+                wordIndex = wordIndex,
+                isPlaying = isPlaying,
                 onTogglePlay = {
                     view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                     isPlaying = !isPlaying
                 }
             )
 
-            // Barra controlli inferiore (Selettore Modalità Corona, Play/Pausa, Reset, Libreria EPUB/TXT)
+            // Controlli Inferiori: Badge Corona + Salto Capitoli + Play/Pausa + Libreria
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                // Pillola interattiva per cambiare la funzione della corona
                 Row(
                     modifier = Modifier
                         .clip(RoundedCornerShape(12.dp))
                         .background(
-                            if (crownMode == CrownMode.WPM_SPEED) Color(0xFF3E1818)
-                            else Color(0xFF1A2936)
+                            if (activeCrownIsWpm) Color(0xFF3E1818) else Color(0xFF1A2936)
                         )
                         .clickable {
                             view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                            crownMode = if (crownMode == CrownMode.WORD_SCRUB) {
-                                CrownMode.WPM_SPEED
-                            } else {
-                                CrownMode.WORD_SCRUB
+                            crownSetting = when (crownSetting) {
+                                CrownControlSetting.AUTO_SMART -> CrownControlSetting.ALWAYS_WPM
+                                CrownControlSetting.ALWAYS_WPM -> CrownControlSetting.ALWAYS_SCRUB
+                                CrownControlSetting.ALWAYS_SCRUB -> CrownControlSetting.AUTO_SMART
                             }
                         }
-                        .padding(horizontal = 10.dp, vertical = 3.dp),
+                        .padding(horizontal = 9.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Icon(
-                        imageVector = if (crownMode == CrownMode.WPM_SPEED) Icons.Default.Speed else Icons.Default.SwipeVertical,
+                        imageVector = if (activeCrownIsWpm) Icons.Default.Speed else Icons.Default.SwipeVertical,
                         contentDescription = "Modalità Corona",
-                        tint = if (crownMode == CrownMode.WPM_SPEED) Color(0xFFFF5252) else Color(0xFF64B5F6),
-                        modifier = Modifier.size(12.dp)
+                        tint = if (activeCrownIsWpm) Color(0xFFFF5252) else Color(0xFF64B5F6),
+                        modifier = Modifier.size(11.dp)
                     )
+                    val modeLabel = when (crownSetting) {
+                        CrownControlSetting.AUTO_SMART -> if (isPlaying) "AUTO: WPM" else "AUTO: PAROLE"
+                        CrownControlSetting.ALWAYS_WPM -> "FISSO: WPM"
+                        CrownControlSetting.ALWAYS_SCRUB -> "FISSO: PAROLE"
+                    }
                     Text(
-                        text = if (crownMode == CrownMode.WPM_SPEED) "CORONA: WPM" else "CORONA: PAROLE",
+                        text = modeLabel,
                         color = Color.White,
-                        fontSize = 10.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                 }
 
-                // Pulsanti rapidi: Libreria | Play/Pausa | Riavvolgi
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     SmallCircleButton(
                         icon = Icons.Default.FolderOpen,
-                        contentDesc = "Apri TXT/EPUB",
+                        contentDesc = "Libreria",
                         onClick = {
                             isPlaying = false
                             showLibraryDialog = true
+                        }
+                    )
+
+                    SmallCircleButton(
+                        icon = Icons.Default.SkipPrevious,
+                        contentDesc = "Capitolo Precedente",
+                        onClick = {
+                            isPlaying = false
+                            val prevChap = currentBook.chapterIndices.lastOrNull { it < wordIndex - 5 } ?: 0
+                            wordIndex = prevChap
                         }
                     )
 
@@ -304,11 +359,13 @@ fun SpritzReaderApp() {
                     }
 
                     SmallCircleButton(
-                        icon = Icons.Default.Replay,
-                        contentDesc = "Inizio",
+                        icon = Icons.Default.SkipNext,
+                        contentDesc = "Capitolo Successivo",
                         onClick = {
                             isPlaying = false
-                            wordIndex = 0
+                            val nextChap = currentBook.chapterIndices.firstOrNull { it > wordIndex }
+                                ?: currentBook.words.lastIndex
+                            wordIndex = nextChap
                         }
                     )
                 }
@@ -317,18 +374,23 @@ fun SpritzReaderApp() {
     }
 }
 
-/**
- * Riproduce fedelmente il frame Spritz mostrato nel video:
- * - Linea guida superiore con il mirino circolare esattamente al centro
- * - Parola allineata con la lettera ORP rossa sotto il mirino
- * - Linea guida inferiore
- */
 @Composable
 fun SpritzReticleStage(
-    word: String,
+    words: List<String>,
+    wordIndex: Int,
+    isPlaying: Boolean,
     onTogglePlay: () -> Unit
 ) {
+    val word = words.getOrElse(wordIndex) { "" }
     val spritz = remember(word) { BookParser.toSpritzWord(word) }
+
+    // Scala dinamicamente il font per le parole italiane molto lunghe
+    val dynamicFontSize = when {
+        word.length <= 9 -> 24.sp
+        word.length in 10..13 -> 20.sp
+        word.length in 14..17 -> 17.sp
+        else -> 14.sp
+    }
 
     Column(
         modifier = Modifier
@@ -336,7 +398,7 @@ fun SpritzReticleStage(
             .clickable { onTogglePlay() },
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Barra orizzontale superiore con mirino circolare centrale (come nel video)
+        // Barra superiore con mirino circolare centrale
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
@@ -346,21 +408,18 @@ fun SpritzReticleStage(
             val centerX = size.width / 2f
             val circleRadius = 5.dp.toPx()
 
-            // Segmento sinistro
             drawLine(
                 color = Color.White,
                 start = Offset(8f, centerY),
                 end = Offset(centerX - circleRadius, centerY),
                 strokeWidth = 1.5.dp.toPx()
             )
-            // Mirino circolare centrale
             drawCircle(
                 color = Color.White,
                 radius = circleRadius,
                 center = Offset(centerX, centerY),
                 style = Stroke(width = 1.5.dp.toPx())
             )
-            // Segmento destro
             drawLine(
                 color = Color.White,
                 start = Offset(centerX + circleRadius, centerY),
@@ -369,43 +428,38 @@ fun SpritzReticleStage(
             )
         }
 
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(4.dp))
 
-        // Parola divisa in 3 blocchi per bloccare la lettera ORP rossa sotto il mirino centrale
+        // Parola allineata con ORP rosso fisso sotto il mirino
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(36.dp),
+                .height(34.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Prefisso allineato a destra verso il centro
             Text(
                 text = spritz.prefix,
                 color = Color.White,
-                fontSize = 24.sp,
+                fontSize = dynamicFontSize,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Medium,
                 textAlign = TextAlign.End,
                 maxLines = 1,
                 modifier = Modifier.weight(1f)
             )
-
-            // Lettera ORP rossa fissa al centro esatto sotto il mirino
             Text(
                 text = spritz.pivot,
                 color = Color(0xFFE53935),
-                fontSize = 24.sp,
+                fontSize = dynamicFontSize,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
                 maxLines = 1
             )
-
-            // Suffisso allineato a sinistra dopo il centro
             Text(
                 text = spritz.suffix,
                 color = Color.White,
-                fontSize = 24.sp,
+                fontSize = dynamicFontSize,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Medium,
                 textAlign = TextAlign.Start,
@@ -414,13 +468,13 @@ fun SpritzReticleStage(
             )
         }
 
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(4.dp))
 
-        // Barra orizzontale inferiore con tacca verticale di riferimento
+        // Barra inferiore
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(10.dp)
+                .height(8.dp)
         ) {
             val centerY = size.height / 2f
             val centerX = size.width / 2f
@@ -437,6 +491,37 @@ fun SpritzReticleStage(
                 strokeWidth = 1.5.dp.toPx()
             )
         }
+
+        // Chicca UX: Anteprima del contesto della frase quando il lettore è in Pausa
+        if (!isPlaying && words.isNotEmpty()) {
+            val startCtx = (wordIndex - 4).coerceAtLeast(0)
+            val endCtx = (wordIndex + 4).coerceAtMost(words.lastIndex)
+            val annotatedContext = buildAnnotatedString {
+                for (i in startCtx..endCtx) {
+                    if (i == wordIndex) {
+                        withStyle(SpanStyle(color = Color(0xFFE53935), fontWeight = FontWeight.Bold)) {
+                            append("${words[i]} ")
+                        }
+                    } else {
+                        withStyle(SpanStyle(color = Color(0xFF757575))) {
+                            append("${words[i]} ")
+                        }
+                    }
+                }
+            }
+            Text(
+                text = annotatedContext,
+                fontSize = 9.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp, start = 12.dp, end = 12.dp)
+            )
+        } else {
+            Spacer(modifier = Modifier.height(13.dp))
+        }
     }
 }
 
@@ -448,7 +533,7 @@ fun SmallCircleButton(
 ) {
     Box(
         modifier = Modifier
-            .size(28.dp)
+            .size(26.dp)
             .clip(CircleShape)
             .background(Color(0xFF262626))
             .clickable { onClick() },
@@ -458,97 +543,131 @@ fun SmallCircleButton(
             imageVector = icon,
             contentDescription = contentDesc,
             tint = Color.White,
-            modifier = Modifier.size(15.dp)
+            modifier = Modifier.size(14.dp)
         )
     }
 }
 
 @Composable
 fun LibraryScreen(
-    onSelectBook: (BookItem) -> Unit,
+    onSelectFile: (File) -> Unit,
+    onSelectDemo: () -> Unit,
     onOpenSystemPicker: () -> Unit,
     onClose: () -> Unit
 ) {
-    val localFiles = remember { BookParser.scanDownloadBooksFolder() }
+    val context = LocalContext.current
+    var savedFiles by remember { mutableStateOf(BookParser.listSavedBooks(context)) }
+    var wifiUrl by remember { mutableStateOf<String?>(null) }
+
+    val wifiServer = remember {
+        WifiBookServer(context) { uploadedFile ->
+            savedFiles = BookParser.listSavedBooks(context)
+            onSelectFile(uploadedFile)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { wifiServer.stop() }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .padding(18.dp),
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)
+        verticalArrangement = Arrangement.spacedBy(5.dp, Alignment.CenterVertically)
     ) {
         Text(
-            text = "LIBRERIA (.TXT / .EPUB)",
+            text = "LIBRERIA (.EPUB / .TXT)",
             color = Color(0xFFE53935),
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold
         )
 
-        // Pulsante per scegliere qualsiasi file .txt o .epub tramite il file manager di Wear OS
+        // Pulsante Caricamento Wi-Fi dal telefono/PC
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(10.dp))
-                .background(Color(0xFF1E2A38))
-                .clickable { onOpenSystemPicker() }
-                .padding(vertical = 8.dp, horizontal = 10.dp),
+                .background(Color(0xFF1B3B2B))
+                .clickable {
+                    wifiUrl = if (wifiUrl == null) wifiServer.start(8080) else {
+                        wifiServer.stop()
+                        null
+                    }
+                }
+                .padding(vertical = 6.dp, horizontal = 8.dp),
             contentAlignment = Alignment.Center
         ) {
-            Text(
-                text = "Sfoglia File (.epub / .txt)",
-                color = Color.White,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Wifi,
+                    contentDescription = "Wi-Fi",
+                    tint = Color(0xFF81C784),
+                    modifier = Modifier.size(13.dp)
+                )
+                Text(
+                    text = wifiUrl ?: "Carica via Wi-Fi (PC/Tel)",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
+                )
+            }
         }
 
-        // Libro Demo integrato
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(Color(0xFF1F1F1F))
-                .clickable { onSelectBook(BookParser.getDemoBook()) }
-                .padding(vertical = 6.dp, horizontal = 10.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = "Demo: HEADLINE Spritz",
-                color = Color.LightGray,
-                fontSize = 11.sp
-            )
-        }
-
-        // Elenco automatico dei file trovati in /sdcard/Download
-        localFiles.take(2).forEach { file ->
+        // Elenco dei libri caricati nella memoria dell'orologio
+        savedFiles.take(2).forEach { file ->
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
                     .background(Color(0xFF1F1F1F))
-                    .clickable { onSelectBook(BookParser.parseFile(file)) }
+                    .clickable { onSelectFile(file) }
                     .padding(vertical = 6.dp, horizontal = 10.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = file.name,
                     color = Color.White,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
             }
         }
 
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF1E2A38))
+                    .clickable { onOpenSystemPicker() }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+                Text("File Picker", color = Color.White, fontSize = 10.sp)
+            }
+
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF2A2A2A))
+                    .clickable { onSelectDemo() }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+                Text("Demo", color = Color.LightGray, fontSize = 10.sp)
+            }
+        }
+
         Text(
-            text = "Indietro",
+            text = "Chiudi",
             color = Color.Gray,
-            fontSize = 11.sp,
-            modifier = Modifier
-                .padding(top = 4.dp)
-                .clickable { onClose() }
+            fontSize = 10.sp,
+            modifier = Modifier.clickable { onClose() }
         )
     }
 }
