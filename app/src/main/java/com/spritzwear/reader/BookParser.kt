@@ -1,6 +1,8 @@
 package com.spritzwear.reader
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Environment
 import java.io.BufferedReader
@@ -13,32 +15,39 @@ import java.net.ServerSocket
 import java.net.URLDecoder
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
-import kotlin.math.roundToLong
 
 data class SpritzWord(
     val prefix: String,
     val pivot: String,
-    val suffix: String,
-    val delayMultiplier: Float
+    val suffix: String
+)
+
+data class ChapterInfo(
+    val title: String,
+    val startWordIndex: Int,
+    val endWordIndex: Int
 )
 
 data class BookItem(
     val id: String,
     val title: String,
     val words: List<String>,
-    val chapterIndices: List<Int> = listOf(0)
+    val chapters: List<ChapterInfo>
+)
+
+data class BookSummary(
+    val file: File,
+    val id: String,
+    val displayTitle: String,
+    val coverBitmap: Bitmap?,
+    val completionPercent: Int
 )
 
 object BookParser {
 
-    /**
-     * Calcola l'Optimal Recognition Point (ORP):
-     * per le parole molto lunghe mantiene il pivot leggermente più centrato
-     * così il suffisso ha più spazio sul quadrante rotondo.
-     */
     fun toSpritzWord(rawWord: String): SpritzWord {
         val word = rawWord.trim()
-        if (word.isEmpty()) return SpritzWord("", "", "", 1.0f)
+        if (word.isEmpty()) return SpritzWord("", "", "")
 
         val cleanLength = word.trimEnd('.', ',', ';', ':', '!', '?', '"', '\'', ')', ']').length
         val pivotIndex = when {
@@ -54,38 +63,16 @@ object BookParser {
         val pivot = word.substring(pivotIndex, pivotIndex + 1)
         val suffix = if (pivotIndex + 1 < word.length) word.substring(pivotIndex + 1) else ""
 
-        val lastChar = word.last()
-        var multiplier = when (lastChar) {
-            '.', '!', '?' -> 2.3f
-            ';', ':' -> 1.8f
-            ',' -> 1.5f
-            else -> 1.0f
-        }
-        if (cleanLength > 8) multiplier *= 1.35f
-        if (cleanLength > 14) multiplier *= 1.25f
-
-        return SpritzWord(prefix, pivot, suffix, multiplier)
+        return SpritzWord(prefix, pivot, suffix)
     }
 
-    fun calculateDelayMs(wpm: Int, multiplier: Float, rampFactor: Float = 1.0f): Long {
-        val effectiveWpm = (wpm * rampFactor).coerceAtLeast(60f)
-        val baseMs = 60_000f / effectiveWpm
-        return (baseMs * multiplier).roundToLong()
-    }
-
-    /**
-     * Restituisce e crea (se non esistono) le cartelle dedicate dove l'utente può copiare i file.
-     * Percorso primario: /sdcard/SpritzBooks
-     */
     fun getDedicatedFolders(context: Context): List<File> {
         val folders = mutableListOf<File>()
 
-        // 1. /storage/emulated/0/SpritzBooks (/sdcard/SpritzBooks)
         val rootSpritz = File(Environment.getExternalStorageDirectory(), "SpritzBooks")
         runCatching { if (!rootSpritz.exists()) rootSpritz.mkdirs() }
         folders.add(rootSpritz)
 
-        // 2. /storage/emulated/0/Download/SpritzBooks
         val downloadSpritz = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
             "SpritzBooks"
@@ -93,15 +80,12 @@ object BookParser {
         runCatching { if (!downloadSpritz.exists()) downloadSpritz.mkdirs() }
         folders.add(downloadSpritz)
 
-        // 3. Cartella media accessibile da ADB senza permessi speciali:
-        // /sdcard/Android/media/com.spritzwear.reader/Books
         context.externalMediaDirs.firstOrNull()?.let { mediaDir ->
             val mediaBooks = File(mediaDir, "Books")
             runCatching { if (!mediaBooks.exists()) mediaBooks.mkdirs() }
             folders.add(mediaBooks)
         }
 
-        // 4. Cartella interna dell'app (usata anche dal server Wi-Fi)
         val internalBooks = File(context.filesDir, "SpritzBooks")
         runCatching { if (!internalBooks.exists()) internalBooks.mkdirs() }
         folders.add(internalBooks)
@@ -126,6 +110,95 @@ object BookParser {
             .sortedBy { it.name.lowercase() }
     }
 
+    /**
+     * Costruisce i metadati della Libreria (Copertina ridimensionata + Percentuale di completamento).
+     */
+    fun getBookSummaries(context: Context): List<BookSummary> {
+        val prefs = context.getSharedPreferences("spritz_prefs", Context.MODE_PRIVATE)
+        val files = scanBooksFolders(context)
+
+        return files.map { file ->
+            val id = file.name
+            val savedIdx = prefs.getInt("saved_index_$id", 0)
+            var totalWords = prefs.getInt("saved_total_$id", 0)
+
+            // Se il libro non è mai stato aperto, esegue un pre-calcolo rapido del totale parole
+            if (totalWords <= 0) {
+                runCatching {
+                    val parsed = parseFile(context, file)
+                    totalWords = parsed.words.size
+                    prefs.edit().putInt("saved_total_$id", totalWords).apply()
+                }
+            }
+
+            val percent = if (totalWords > 1) {
+                ((savedIdx.toFloat() / (totalWords - 1).toFloat()) * 100f).toInt().coerceIn(0, 100)
+            } else 0
+
+            val cover = if (file.name.endsWith(".epub", true)) {
+                extractEpubCover(context, file)
+            } else null
+
+            BookSummary(
+                file = file,
+                id = id,
+                displayTitle = file.name.substringBeforeLast('.'),
+                coverBitmap = cover,
+                completionPercent = percent
+            )
+        }
+    }
+
+    /**
+     * Estrae l'immagine di copertina dall'EPUB e la salva in cache per non rallentare la lista.
+     */
+    private fun extractEpubCover(context: Context, epubFile: File): Bitmap? {
+        val cacheDir = File(context.cacheDir, "covers").apply { mkdirs() }
+        val cachedCover = File(cacheDir, "${epubFile.name}.png")
+        if (cachedCover.exists()) {
+            return BitmapFactory.decodeFile(cachedCover.absolutePath)
+        }
+
+        var bestBytes: ByteArray? = null
+        runCatching {
+            ZipInputStream(epubFile.inputStream()).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    val lower = entry.name.lowercase()
+                    if (!entry.isDirectory && (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp"))) {
+                        val bytes = zip.readBytes()
+                        if (lower.contains("cover") || lower.contains("copertina") || lower.contains("front")) {
+                            bestBytes = bytes
+                            break
+                        } else if (bestBytes == null && bytes.size in 1_500..2_500_000) {
+                            bestBytes = bytes
+                        }
+                    }
+                    zip.closeEntry()
+                    entry = zip.nextEntry
+                }
+            }
+        }
+
+        val data = bestBytes ?: return null
+        return runCatching {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(data, 0, data.size, opts)
+            var sample = 1
+            while (opts.outWidth / sample > 96 || opts.outHeight / sample > 96) {
+                sample *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = BitmapFactory.decodeByteArray(data, 0, data.size, decodeOpts)
+            if (bmp != null) {
+                cachedCover.outputStream().use { out ->
+                    bmp.compress(Bitmap.CompressFormat.PNG, 90, out)
+                }
+            }
+            bmp
+        }.getOrNull()
+    }
+
     fun importUriToInternalStorage(context: Context, uri: Uri, displayName: String): BookItem {
         val safeName = displayName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
         val targetDir = File(context.filesDir, "SpritzBooks").apply { mkdirs() }
@@ -135,12 +208,17 @@ object BookParser {
                 input.copyTo(output)
             }
         }
-        return parseFile(destFile)
+        return parseFile(context, destFile)
     }
 
-    fun parseFile(file: File): BookItem {
+    fun parseFile(context: Context, file: File): BookItem {
         if (!file.exists()) return getDemoBook()
-        return file.inputStream().use { parseStream(it, file.name) }
+        val item = file.inputStream().use { parseStream(it, file.name) }
+        context.getSharedPreferences("spritz_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putInt("saved_total_${item.id}", item.words.size)
+            .apply()
+        return item
     }
 
     private fun parseStream(inputStream: InputStream, fileName: String): BookItem {
@@ -148,13 +226,22 @@ object BookParser {
             parseEpubStream(inputStream, fileName)
         } else {
             val text = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8)).readText()
-            val words = tokenize(text)
-            val chapters = words.indices.step(1500).toList().ifEmpty { listOf(0) }
+            val words = tokenize(text).ifEmpty { listOf("File", "vuoto.") }
+            val step = 1000
+            val chapters = mutableListOf<ChapterInfo>()
+            var start = 0
+            var num = 1
+            while (start < words.size) {
+                val end = (start + step - 1).coerceAtMost(words.lastIndex)
+                chapters.add(ChapterInfo("Parte $num", start, end))
+                start += step
+                num++
+            }
             BookItem(
                 id = fileName,
                 title = fileName.substringBeforeLast('.').uppercase(),
-                words = words.ifEmpty { listOf("File", "vuoto.") },
-                chapterIndices = chapters
+                words = words,
+                chapters = chapters.ifEmpty { listOf(ChapterInfo("Capitolo 1", 0, words.lastIndex)) }
             )
         }
     }
@@ -225,27 +312,43 @@ object BookParser {
         }
 
         val allWords = mutableListOf<String>()
-        val chapterStartIndices = mutableListOf<Int>()
+        val chapters = mutableListOf<ChapterInfo>()
 
         orderedChapterHtmls.forEach { html ->
+            val extractedTitle = extractChapterHeading(html)
             val chapterWords = tokenize(stripHtmlTags(html))
             if (chapterWords.isNotEmpty()) {
-                chapterStartIndices.add(allWords.size)
+                val startIdx = allWords.size
                 allWords.addAll(chapterWords)
+                val endIdx = allWords.lastIndex
+                val chapNumber = chapters.size + 1
+                val finalTitle = extractedTitle?.takeIf { it.length in 2..45 } ?: "Capitolo $chapNumber"
+                chapters.add(ChapterInfo(finalTitle, startIdx, endIdx))
             }
         }
 
         if (allWords.isEmpty()) {
             allWords.addAll(listOf("Impossibile", "estrarre", "testo", "dall'EPUB."))
-            chapterStartIndices.add(0)
+            chapters.add(ChapterInfo("Capitolo 1", 0, allWords.lastIndex))
         }
 
         return BookItem(
             id = fileName,
             title = fileName.substringBeforeLast('.').uppercase(),
             words = allWords,
-            chapterIndices = chapterStartIndices
+            chapters = chapters
         )
+    }
+
+    private fun extractChapterHeading(html: String): String? {
+        val headingRegex = Regex("""<(h1|h2|h3|title)[^>]*>(.*?)</\1>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        for (match in headingRegex.findAll(html)) {
+            val raw = stripHtmlTags(match.groupValues[2]).trim().replace(Regex("\\s+"), " ")
+            if (raw.isNotBlank() && !raw.equals("unknown", true) && !raw.endsWith(".xhtml", true)) {
+                return raw
+            }
+        }
+        return null
     }
 
     private fun stripHtmlTags(html: String): String {
@@ -273,18 +376,28 @@ object BookParser {
     }
 
     fun getDemoBook(): BookItem {
-        val sample = """
-            HEADLINE delivers to Spritz, flashes right sul tuo OnePlus Watch 3 a 240 DPI!
-            Anche parole lunghissime come precipitevolissimevolmente o anticostituzionalmente
-            vengono centrate e ridimensionate al millimetro senza mai tagliare nemmeno una lettera.
-            Copia i tuoi file EPUB e TXT nella cartella SpritzBooks dell'orologio,
-            oppure disattiva la vibrazione della corona con il tasto in basso a destra!
-        """.trimIndent()
+        val ch1 = tokenize(
+            "HEADLINE delivers to Spritz, flashes right sul tuo OnePlus Watch 3! " +
+            "La densità di questa app è bloccata nativamente a 320 DPI anche se il sistema è a 240 DPI."
+        )
+        val ch2 = tokenize(
+            "Ruota la corona per scorrere le parole al tuo ritmo. " +
+            "Tocca il titolo del capitolo in alto per aprire la lista completa dei capitoli e saltare dove vuoi!"
+        )
+        val ch3 = tokenize(
+            "Nella schermata Libreria ora vedi la copertina di ogni libro EPUB " +
+            "con la percentuale di completamento sempre aggiornata."
+        )
+        val all = ch1 + ch2 + ch3
         return BookItem(
             id = "demo_spritz",
-            title = "HEADLINE",
-            words = tokenize(sample),
-            chapterIndices = listOf(0, 18, 32)
+            title = "SPRITZ WEAR",
+            words = all,
+            chapters = listOf(
+                ChapterInfo("1. Introduzione 320 DPI", 0, ch1.size - 1),
+                ChapterInfo("2. Controllo Corona", ch1.size, ch1.size + ch2.size - 1),
+                ChapterInfo("3. Copertine & Capitoli", ch1.size + ch2.size, all.lastIndex)
+            )
         )
     }
 }
