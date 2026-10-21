@@ -12,6 +12,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/ic_launcher"
+        android:roundIcon="@drawable/ic_launcher"
         android:label="SpritzWear"
         android:requestLegacyExternalStorage="true"
         android:supportsRtl="true"
