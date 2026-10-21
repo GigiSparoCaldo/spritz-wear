@@ -18,6 +18,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -295,7 +296,7 @@ fun SpritzReaderApp() {
                     )
                 }
                 Text(
-                    text = "Capitolo al $chapterPercent% • (${ currentChapterIndex + 1 }/${ currentBook.chapters.size })",
+                    text = "Capitolo al $chapterPercent% • (${currentChapterIndex + 1}/${currentBook.chapters.size})",
                     color = Color(0xFF9E9E9E),
                     fontSize = 9.5.sp,
                     maxLines = 1
@@ -381,7 +382,7 @@ fun SpritzReticleStage(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 1. Barra superiore con mirino circolare centrale
+        // 1. Barra superiore con mirino circolare centrale[cite: 1]
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
@@ -412,7 +413,7 @@ fun SpritzReticleStage(
             )
         }
 
-        // 2. Parola su Canvas a 320 DPI nativi con centratura ORP e anti-taglio
+        // 2. Parola su Canvas a 320 DPI nativi con centratura ORP e anti-taglio[cite: 1]
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
@@ -489,7 +490,7 @@ fun SpritzReticleStage(
             )
         }
 
-        // 3. Barra inferiore con tacca rossa
+        // 3. Barra inferiore con tacca rossa[cite: 1]
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
