@@ -2,12 +2,13 @@ package com.spritzwear.reader
 
 import android.content.Context
 import android.content.Intent
-import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.HapticFeedbackConstants
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,37 +18,47 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Swipe
 import androidx.compose.material.icons.filled.Vibration
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.DoNotDisturbOn
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -59,17 +70,15 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.wear.compose.material.CircularProgressIndicator
-import androidx.wear.compose.material.Icon
-import androidx.wear.compose.material.MaterialTheme
-import androidx.wear.compose.material.Text
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import kotlin.math.abs
 
 enum class ActiveScreen {
@@ -78,36 +87,26 @@ enum class ActiveScreen {
     LIBRARY
 }
 
+private data class WordSpan(
+    val globalIndex: Int,
+    val startChar: Int,
+    val endChar: Int
+)
+
 class MainActivity : ComponentActivity() {
-
-    /**
-     * Forza la configurazione Android di questa Activity a 320 DPI (xhdpi, density = 2.0f),
-     * annullando l'override digitale a 240 DPI impostato nel sistema.
-     */
-    override fun attachBaseContext(newBase: Context) {
-        val config = Configuration(newBase.resources.configuration)
-        config.densityDpi = 320
-        config.fontScale = 1.0f
-        val context320 = newBase.createConfigurationContext(config)
-        super.attachBaseContext(context320)
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         BookParser.getDedicatedFolders(this)
         setContent {
-            // Blocca anche il motore Jetpack Compose esattamente a 320 DPI (320 / 160 = 2.0f)
-            CompositionLocalProvider(LocalDensity provides Density(density = 2.0f, fontScale = 1.0f)) {
-                MaterialTheme {
-                    SpritzReaderApp()
-                }
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                SpritzFlipApp()
             }
         }
     }
 }
 
 @Composable
-fun SpritzReaderApp() {
+fun SpritzFlipApp() {
     val context = LocalContext.current
     val view = LocalView.current
     val scope = rememberCoroutineScope()
@@ -115,16 +114,75 @@ fun SpritzReaderApp() {
 
     var currentBook by remember { mutableStateOf(BookParser.getDemoBook()) }
     var wordIndex by remember { mutableIntStateOf(prefs.getInt("saved_index_${currentBook.id}", 0)) }
+    var wpm by remember { mutableIntStateOf(prefs.getInt("saved_wpm", 300)) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var isTtsEnabled by remember { mutableStateOf(prefs.getBoolean("saved_tts", false)) }
+    var isTtsReady by remember { mutableStateOf(false) }
     var isVibrationEnabled by remember { mutableStateOf(prefs.getBoolean("saved_haptic", true)) }
     var isLoading by remember { mutableStateOf(false) }
     var activeScreen by remember { mutableStateOf(ActiveScreen.READER) }
 
-    var rotaryAccumulator by remember { mutableFloatStateOf(0f) }
-    val focusRequester = remember { FocusRequester() }
+    var wordsReadInSession by remember { mutableIntStateOf(0) }
+    var dragAccumulator by remember { mutableFloatStateOf(0f) }
+
+    // Stato motore Text-to-Speech (TTS)
+    var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
+    val currentChunkSpans = remember { mutableStateListOf<WordSpan>() }
+    var currentUtteranceDone by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
+    var rangeCallbackTriggered by remember { mutableStateOf(false) }
+
+    DisposableEffect(context) {
+        var engine: TextToSpeech? = null
+        engine = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                engine?.language = Locale.ITALIAN
+                engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+
+                    override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
+                        rangeCallbackTriggered = true
+                        val matched = currentChunkSpans.firstOrNull { span ->
+                            start in span.startChar..span.endChar || span.startChar in start..end
+                        }
+                        if (matched != null) {
+                            wordIndex = matched.globalIndex
+                        }
+                    }
+
+                    override fun onDone(utteranceId: String?) {
+                        currentUtteranceDone?.complete(Unit)
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        currentUtteranceDone?.complete(Unit)
+                    }
+                })
+                ttsEngine = engine
+                isTtsReady = true
+            }
+        }
+        onDispose {
+            engine?.stop()
+            engine?.shutdown()
+        }
+    }
+
+    // Imposta automaticamente la lingua del TTS (Italiano o Inglese)
+    LaunchedEffect(currentBook, isTtsReady) {
+        if (isTtsReady) {
+            val sampleText = currentBook.words.take(40).joinToString(" ").lowercase()
+            val englishMarkers = listOf(" the ", " and ", " with ", " delivers ", " flashes ")
+            val isEnglish = englishMarkers.count { sampleText.contains(it) } >= 2
+            ttsEngine?.language = if (isEnglish) Locale.US else Locale.ITALIAN
+        }
+    }
 
     val loadFileAsync: (File) -> Unit = { file ->
         scope.launch {
             isLoading = true
+            isPlaying = false
+            ttsEngine?.stop()
             val loaded = withContext(Dispatchers.IO) { BookParser.parseFile(context, file) }
             currentBook = loaded
             wordIndex = prefs.getInt("saved_index_${loaded.id}", 0).coerceIn(0, loaded.words.lastIndex)
@@ -139,6 +197,8 @@ fun SpritzReaderApp() {
         uri?.let {
             scope.launch {
                 isLoading = true
+                isPlaying = false
+                ttsEngine?.stop()
                 val name = it.lastPathSegment?.substringAfterLast('/') ?: "Libro.epub"
                 val loaded = withContext(Dispatchers.IO) {
                     BookParser.importUriToInternalStorage(context, it, name)
@@ -151,18 +211,99 @@ fun SpritzReaderApp() {
         }
     }
 
-    // Salva automaticamente posizione, totale parole e stato vibrazione
-    LaunchedEffect(wordIndex, currentBook.id, isVibrationEnabled) {
+    LaunchedEffect(wordIndex, wpm, currentBook.id, isVibrationEnabled, isTtsEnabled) {
         prefs.edit()
             .putInt("saved_index_${currentBook.id}", wordIndex)
             .putInt("saved_total_${currentBook.id}", currentBook.words.size)
+            .putInt("saved_wpm", wpm)
             .putBoolean("saved_haptic", isVibrationEnabled)
+            .putBoolean("saved_tts", isTtsEnabled)
             .apply()
     }
 
-    LaunchedEffect(activeScreen, isLoading) {
-        if (activeScreen == ActiveScreen.READER && !isLoading) {
-            focusRequester.requestFocus()
+    // Motore Duale: Lettura Automatica WPM oppure Voce TTS Sincronizzata
+    LaunchedEffect(isPlaying, isTtsEnabled, currentBook) {
+        if (!isPlaying) {
+            ttsEngine?.stop()
+            currentUtteranceDone?.complete(Unit)
+            wordsReadInSession = 0
+            return@LaunchedEffect
+        }
+
+        if (isTtsEnabled && isTtsReady && ttsEngine != null) {
+            while (isPlaying && wordIndex <= currentBook.words.lastIndex) {
+                val startIdx = wordIndex
+                val spans = mutableListOf<WordSpan>()
+                val sb = StringBuilder()
+                var idx = startIdx
+
+                while (idx <= currentBook.words.lastIndex && spans.size < 18) {
+                    val w = currentBook.words[idx]
+                    val s = sb.length
+                    sb.append(w)
+                    val e = sb.length
+                    spans.add(WordSpan(idx, s, e))
+                    sb.append(" ")
+                    idx++
+                    if (w.endsWith(".") || w.endsWith("!") || w.endsWith("?") || w.endsWith(";")) {
+                        break
+                    }
+                }
+
+                currentChunkSpans.clear()
+                currentChunkSpans.addAll(spans)
+                rangeCallbackTriggered = false
+
+                val speechRate = (wpm / 180f).coerceIn(0.5f, 3.0f)
+                ttsEngine?.setSpeechRate(speechRate)
+
+                val doneDeferred = CompletableDeferred<Unit>()
+                currentUtteranceDone = doneDeferred
+
+                ttsEngine?.speak(
+                    sb.toString().trim(),
+                    TextToSpeech.QUEUE_FLUSH,
+                    null,
+                    "SPRITZ_FLIP_$startIdx"
+                )
+
+                for (span in spans) {
+                    if (!isPlaying || doneDeferred.isCompleted) break
+                    if (!rangeCallbackTriggered) {
+                        wordIndex = span.globalIndex
+                    }
+                    val spritz = BookParser.toSpritzWord(currentBook.words[span.globalIndex])
+                    val effectiveTtsWpm = (180f * speechRate).toInt()
+                    val stepDelay = BookParser.calculateDelayMs(effectiveTtsWpm, spritz.delayMultiplier)
+                    delay(stepDelay)
+                }
+
+                doneDeferred.await()
+
+                if (isPlaying) {
+                    val nextIdx = spans.last().globalIndex + 1
+                    if (nextIdx <= currentBook.words.lastIndex) {
+                        wordIndex = nextIdx
+                    } else {
+                        isPlaying = false
+                    }
+                }
+            }
+        } else {
+            while (isPlaying && wordIndex <= currentBook.words.lastIndex) {
+                val currentRawWord = currentBook.words[wordIndex]
+                val spritz = BookParser.toSpritzWord(currentRawWord)
+                val ramp = (0.6f + (wordsReadInSession.coerceAtMost(12) / 12f) * 0.4f)
+                val delayMs = BookParser.calculateDelayMs(wpm, spritz.delayMultiplier, ramp)
+
+                delay(delayMs)
+                if (wordIndex < currentBook.words.lastIndex) {
+                    wordIndex++
+                    wordsReadInSession++
+                } else {
+                    isPlaying = false
+                }
+            }
         }
     }
 
@@ -172,9 +313,9 @@ fun SpritzReaderApp() {
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(indicatorColor = Color(0xFFE53935))
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("Apertura libro...", color = Color.White, fontSize = 12.sp)
+                CircularProgressIndicator(color = Color(0xFFE53935))
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("Apertura libro...", color = Color.White, fontSize = 14.sp)
             }
         }
         return
@@ -185,8 +326,9 @@ fun SpritzReaderApp() {
             ChapterListScreen(
                 book = currentBook,
                 currentWordIndex = wordIndex,
-                isVibrationEnabled = isVibrationEnabled,
                 onSelectChapter = { chapter ->
+                    isPlaying = false
+                    ttsEngine?.stop()
                     wordIndex = chapter.startWordIndex.coerceIn(0, currentBook.words.lastIndex)
                     activeScreen = ActiveScreen.READER
                 },
@@ -199,6 +341,8 @@ fun SpritzReaderApp() {
             LibraryScreen(
                 onSelectFile = { file -> loadFileAsync(file) },
                 onSelectDemo = {
+                    isPlaying = false
+                    ttsEngine?.stop()
                     currentBook = BookParser.getDemoBook()
                     wordIndex = prefs.getInt("saved_index_${currentBook.id}", 0)
                         .coerceIn(0, currentBook.words.lastIndex)
@@ -217,7 +361,7 @@ fun SpritzReaderApp() {
         ActiveScreen.READER -> Unit
     }
 
-    // Calcola il capitolo attuale e la percentuale di completamento del singolo capitolo
+    // Calcolo capitolo attuale e percentuale di completamento del singolo capitolo
     val currentChapterIndex = currentBook.chapters
         .indexOfLast { wordIndex >= it.startWordIndex }
         .coerceAtLeast(0)
@@ -230,59 +374,39 @@ fun SpritzReaderApp() {
         .toInt()
         .coerceIn(0, 100)
 
-    Box(
+    // Layout ottimizzato per la FlexWindow di Z Flip 7 / Z Flip 8 (con margine inferiore per le fotocamere)
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .onRotaryScrollEvent { event ->
-                rotaryAccumulator += event.verticalScrollPixels
-                val threshold = 28f
-                if (abs(rotaryAccumulator) >= threshold) {
-                    val steps = (rotaryAccumulator / threshold).toInt()
-                    rotaryAccumulator %= threshold
-
-                    if (isVibrationEnabled) {
-                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                    }
-
-                    wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
-                }
-                true
-            }
-            .focusRequester(focusRequester)
-            .focusable(),
-        contentAlignment = Alignment.Center
+            .padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 42.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceBetween
     ) {
-        Column(
+        // 1. BARRA SUPERIORE CLICCABILE: Titolo Capitolo + Percentuale Capitolo (Apre Lista Capitoli)
+        Row(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 10.dp, vertical = 12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            // INTESTAZIONE CLICCABILE: Toccando qui si apre la lista dei capitoli
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier
-                    .padding(horizontal = 20.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Color(0xFF141414))
-                    .clickable {
-                        if (isVibrationEnabled) {
-                            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                        }
-                        activeScreen = ActiveScreen.CHAPTER_LIST
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFF161616))
+                .clickable {
+                    isPlaying = false
+                    ttsEngine?.stop()
+                    if (isVibrationEnabled) {
+                        view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                     }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
-                ) {
+                    activeScreen = ActiveScreen.CHAPTER_LIST
+                }
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = currentChapter.title,
                         color = Color.White,
-                        fontSize = 11.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -290,41 +414,169 @@ fun SpritzReaderApp() {
                     )
                     Icon(
                         imageVector = Icons.Default.ArrowDropDown,
-                        contentDescription = "Scegli Capitolo",
+                        contentDescription = "Seleziona Capitolo",
                         tint = Color(0xFFE53935),
-                        modifier = Modifier.size(14.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
+                val ttsRateText = if (isTtsEnabled) {
+                    val rate = String.format(Locale.US, "%.1fx", (wpm / 180f).coerceIn(0.5f, 3.0f))
+                    " • Voce $rate"
+                } else ""
                 Text(
-                    text = "Capitolo al $chapterPercent% • (${currentChapterIndex + 1}/${currentBook.chapters.size})",
-                    color = Color(0xFF9E9E9E),
-                    fontSize = 9.5.sp,
+                    text = "Capitolo al $chapterPercent% (${currentChapterIndex + 1}/${currentBook.chapters.size}) • $wpm WPM$ttsRateText",
+                    color = if (isTtsEnabled) Color(0xFF81C784) else Color(0xFF9E9E9E),
+                    fontSize = 11.sp,
                     maxLines = 1
                 )
             }
+        }
 
-            // MIRINO SPRITZ CENTRALE CON PAROLA E CONTESTO SOTTOSTANTE
-            SpritzReticleStage(
-                words = currentBook.words,
-                wordIndex = wordIndex
-            )
+        // 2. MIRINO SPRITZ CENTRALE (Toccando il mirino si avvia/ferma la lettura)
+        SpritzReticleStage(
+            words = currentBook.words,
+            wordIndex = wordIndex,
+            onTogglePlay = {
+                if (isVibrationEnabled) {
+                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                }
+                if (wordIndex >= currentBook.words.lastIndex) wordIndex = 0
+                isPlaying = !isPlaying
+            }
+        )
 
-            // BARRA CONTROLLI INFERIORE (Libreria | Cap. Prec | Cap. Succ | Vibrazione Corona)
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(bottom = 2.dp)
+        // 3. PANNELLO CONTROLLI FLEXWINDOW (Trackpad manuale parole + Slider WPM + Pulsanti)
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            // Trackpad Touch Orizzontale: scorri il dito a destra/sinistra per girare le parole manualmente
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(32.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF1A242D))
+                    .pointerInput(isVibrationEnabled, currentBook) {
+                        detectHorizontalDragGestures(
+                            onDragStart = {
+                                isPlaying = false
+                                ttsEngine?.stop()
+                                dragAccumulator = 0f
+                            },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                dragAccumulator += dragAmount
+                                val stepPx = 26f
+                                if (abs(dragAccumulator) >= stepPx) {
+                                    val steps = (dragAccumulator / stepPx).toInt()
+                                    dragAccumulator %= stepPx
+                                    if (isVibrationEnabled) {
+                                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                    }
+                                    wordIndex = (wordIndex + steps).coerceIn(0, currentBook.words.lastIndex)
+                                }
+                            }
+                        )
+                    },
+                contentAlignment = Alignment.Center
             ) {
-                SmallCircleButton(
-                    icon = Icons.Default.FolderOpen,
-                    contentDesc = "Libreria EPUB/TXT",
-                    onClick = { activeScreen = ActiveScreen.LIBRARY }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Swipe,
+                        contentDescription = null,
+                        tint = Color(0xFF64B5F6),
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Text(
+                        text = "Scorri qui col dito per girare le parole",
+                        color = Color(0xFFB0BEC5),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            // Regolatore Velocità WPM (-25 | Slider 100..1000 WPM | +25)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(30.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SmallControlButton(
+                    icon = Icons.Default.Remove,
+                    contentDesc = "-25 WPM",
+                    onClick = {
+                        wpm = (wpm - 25).coerceIn(100, 1000)
+                        if (isTtsEnabled && isPlaying) {
+                            ttsEngine?.setSpeechRate((wpm / 180f).coerceIn(0.5f, 3.0f))
+                        }
+                    }
                 )
 
-                SmallCircleButton(
+                Slider(
+                    value = wpm.toFloat(),
+                    onValueChange = { newVal ->
+                        val stepped = ((newVal.toInt() / 10) * 10).coerceIn(100, 1000)
+                        if (stepped != wpm) {
+                            wpm = stepped
+                            if (isVibrationEnabled) {
+                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                            }
+                            if (isTtsEnabled && isPlaying) {
+                                ttsEngine?.setSpeechRate((wpm / 180f).coerceIn(0.5f, 3.0f))
+                            }
+                        }
+                    },
+                    valueRange = 100f..1000f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFFE53935),
+                        activeTrackColor = Color(0xFFE53935),
+                        inactiveTrackColor = Color(0xFF333333)
+                    ),
+                    modifier = Modifier.weight(1f)
+                )
+
+                SmallControlButton(
+                    icon = Icons.Default.Add,
+                    contentDesc = "+25 WPM",
+                    onClick = {
+                        wpm = (wpm + 25).coerceIn(100, 1000)
+                        if (isTtsEnabled && isPlaying) {
+                            ttsEngine?.setSpeechRate((wpm / 180f).coerceIn(0.5f, 3.0f))
+                        }
+                    }
+                )
+            }
+
+            // Barra Azioni: Libreria | Cap. Prec | PLAY/PAUSA | Cap. Succ | Voce TTS | Vibrazione
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SmallControlButton(
+                    icon = Icons.Default.FolderOpen,
+                    contentDesc = "Libreria EPUB/TXT",
+                    onClick = {
+                        isPlaying = false
+                        ttsEngine?.stop()
+                        activeScreen = ActiveScreen.LIBRARY
+                    }
+                )
+
+                SmallControlButton(
                     icon = Icons.Default.SkipPrevious,
                     contentDesc = "Capitolo Precedente",
                     onClick = {
+                        isPlaying = false
+                        ttsEngine?.stop()
                         val prevIdx = if (wordIndex > currentChapter.startWordIndex + 3) {
                             currentChapter.startWordIndex
                         } else {
@@ -334,19 +586,68 @@ fun SpritzReaderApp() {
                     }
                 )
 
-                SmallCircleButton(
+                // Pulsante Centrale Play / Pausa
+                Box(
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(if (isTtsEnabled) Color(0xFF2E7D32) else Color(0xFFD32F2F))
+                        .clickable {
+                            if (isVibrationEnabled) {
+                                view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                            }
+                            if (wordIndex >= currentBook.words.lastIndex) wordIndex = 0
+                            isPlaying = !isPlaying
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        contentDescription = "Play/Pausa",
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+
+                SmallControlButton(
                     icon = Icons.Default.SkipNext,
                     contentDesc = "Capitolo Successivo",
                     onClick = {
+                        isPlaying = false
+                        ttsEngine?.stop()
                         val nextIdx = currentBook.chapters.getOrNull(currentChapterIndex + 1)?.startWordIndex
                             ?: currentBook.words.lastIndex
                         wordIndex = nextIdx
                     }
                 )
 
+                // Toggle Voce TTS On / Off
                 Box(
                     modifier = Modifier
-                        .size(28.dp)
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(if (isTtsEnabled) Color(0xFF1B5E20) else Color(0xFF262626))
+                        .clickable {
+                            isTtsEnabled = !isTtsEnabled
+                            if (!isTtsEnabled) ttsEngine?.stop()
+                            if (isVibrationEnabled) {
+                                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (isTtsEnabled) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                        contentDescription = "Voce TTS On/Off",
+                        tint = if (isTtsEnabled) Color(0xFF81C784) else Color.White,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                // Toggle Vibrazione On / Off
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
                         .clip(CircleShape)
                         .background(if (isVibrationEnabled) Color(0xFF1E3A2F) else Color(0xFF262626))
                         .clickable {
@@ -359,9 +660,9 @@ fun SpritzReaderApp() {
                 ) {
                     Icon(
                         imageVector = if (isVibrationEnabled) Icons.Default.Vibration else Icons.Outlined.DoNotDisturbOn,
-                        contentDescription = "Vibrazione Corona On/Off",
+                        contentDescription = "Vibrazione On/Off",
                         tint = if (isVibrationEnabled) Color(0xFF81C784) else Color(0xFF757575),
-                        modifier = Modifier.size(15.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
             }
@@ -372,65 +673,67 @@ fun SpritzReaderApp() {
 @Composable
 fun SpritzReticleStage(
     words: List<String>,
-    wordIndex: Int
+    wordIndex: Int,
+    onTogglePlay: () -> Unit
 ) {
     val word = words.getOrElse(wordIndex) { "" }
     val spritz = remember(word) { BookParser.toSpritzWord(word) }
     val textMeasurer = rememberTextMeasurer()
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onTogglePlay() },
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 1. Barra superiore con mirino circolare centrale[cite: 1]
+        // 1. Barra superiore con mirino circolare centrale (fedele al video)
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp)
-                .height(13.dp)
+                .padding(horizontal = 8.dp)
+                .height(16.dp)
         ) {
             val centerY = size.height / 2f
             val centerX = size.width / 2f
-            val circleRadius = 4.5.dp.toPx()
+            val circleRadius = 5.5.dp.toPx()
 
             drawLine(
                 color = Color.White,
                 start = Offset(0f, centerY),
                 end = Offset(centerX - circleRadius, centerY),
-                strokeWidth = 1.4.dp.toPx()
+                strokeWidth = 1.6.dp.toPx()
             )
             drawCircle(
                 color = Color.White,
                 radius = circleRadius,
                 center = Offset(centerX, centerY),
-                style = Stroke(width = 1.4.dp.toPx())
+                style = Stroke(width = 1.6.dp.toPx())
             )
             drawLine(
                 color = Color.White,
                 start = Offset(centerX + circleRadius, centerY),
                 end = Offset(size.width, centerY),
-                strokeWidth = 1.4.dp.toPx()
+                strokeWidth = 1.6.dp.toPx()
             )
         }
 
-        // 2. Parola su Canvas a 320 DPI nativi con centratura ORP e anti-taglio[cite: 1]
+        // 2. Parola su Canvas con allineamento ORP rosso e ridimensionamento anti-taglio
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(38.dp)
+                .height(48.dp)
         ) {
             if (word.isEmpty()) return@Canvas
 
-            val safePadding = 8.dp.toPx()
+            val safePadding = 10.dp.toPx()
             val availableWidth = size.width - (safePadding * 2f)
             val centerX = size.width / 2f
 
             var fontSizeSp = when {
-                word.length <= 8 -> 24f
-                word.length in 9..11 -> 21f
-                word.length in 12..14 -> 18f
-                word.length in 15..18 -> 15.5f
-                else -> 13.5f
+                word.length <= 9 -> 30f
+                word.length in 10..13 -> 26f
+                word.length in 14..17 -> 22f
+                else -> 18f
             }
 
             val annotatedWord = buildAnnotatedString {
@@ -455,7 +758,7 @@ fun SpritzReticleStage(
                 maxLines = 1
             )
 
-            while (layoutResult.size.width > availableWidth && fontSizeSp > 10f) {
+            while (layoutResult.size.width > availableWidth && fontSizeSp > 12f) {
                 fontSizeSp -= 1f
                 layoutResult = textMeasurer.measure(
                     text = annotatedWord,
@@ -490,12 +793,12 @@ fun SpritzReticleStage(
             )
         }
 
-        // 3. Barra inferiore con tacca rossa[cite: 1]
+        // 3. Barra inferiore con tacca rossa
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp)
-                .height(9.dp)
+                .padding(horizontal = 8.dp)
+                .height(10.dp)
         ) {
             val centerY = size.height / 2f
             val centerX = size.width / 2f
@@ -503,20 +806,20 @@ fun SpritzReticleStage(
                 color = Color.White,
                 start = Offset(0f, centerY),
                 end = Offset(size.width, centerY),
-                strokeWidth = 1.4.dp.toPx()
+                strokeWidth = 1.6.dp.toPx()
             )
             drawLine(
                 color = Color(0xFFE53935),
-                start = Offset(centerX, centerY - 3.5.dp.toPx()),
+                start = Offset(centerX, centerY - 4.dp.toPx()),
                 end = Offset(centerX, centerY),
-                strokeWidth = 1.4.dp.toPx()
+                strokeWidth = 1.6.dp.toPx()
             )
         }
 
         // Anteprima del contesto della frase intorno alla parola attiva
         if (words.isNotEmpty()) {
-            val startCtx = (wordIndex - 3).coerceAtLeast(0)
-            val endCtx = (wordIndex + 3).coerceAtMost(words.lastIndex)
+            val startCtx = (wordIndex - 4).coerceAtLeast(0)
+            val endCtx = (wordIndex + 4).coerceAtMost(words.lastIndex)
             val annotatedContext = buildAnnotatedString {
                 for (i in startCtx..endCtx) {
                     if (i == wordIndex) {
@@ -532,64 +835,57 @@ fun SpritzReticleStage(
             }
             Text(
                 text = annotatedContext,
-                fontSize = 9.5.sp,
+                fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 3.dp, start = 14.dp, end = 14.dp)
+                    .padding(top = 4.dp, start = 8.dp, end = 8.dp)
             )
         }
     }
 }
 
-/**
- * Schermata di selezione dei Capitoli quando si clicca sul titolo in alto.
- */
 @Composable
 fun ChapterListScreen(
     book: BookItem,
     currentWordIndex: Int,
-    isVibrationEnabled: Boolean,
     onSelectChapter: (ChapterInfo) -> Unit,
     onClose: () -> Unit
 ) {
-    val view = LocalView.current
     val scrollState = rememberScrollState()
-    val focusRequester = remember { FocusRequester() }
-    val scope = rememberCoroutineScope()
-
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .onRotaryScrollEvent { event ->
-                scope.launch {
-                    scrollState.scrollBy(event.verticalScrollPixels)
-                }
-                if (isVibrationEnabled) {
-                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                }
-                true
-            }
-            .focusRequester(focusRequester)
-            .focusable()
             .verticalScroll(scrollState)
-            .padding(horizontal = 20.dp, vertical = 18.dp),
+            .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 44.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text(
-            text = "CAPITOLI (${book.chapters.size})",
-            color = Color(0xFFE53935),
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "CAPITOLI (${book.chapters.size})",
+                color = Color(0xFFE53935),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF2C2C2C))
+                    .clickable { onClose() }
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Text("Chiudi", color = Color.White, fontSize = 12.sp)
+            }
+        }
 
         book.chapters.forEachIndexed { idx, chapter ->
             val isCurrent = currentWordIndex in chapter.startWordIndex..chapter.endWordIndex
@@ -607,53 +903,42 @@ fun ChapterListScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
-                    .background(if (isCurrent) Color(0xFF3E1818) else Color(0xFF1E1E1E))
+                    .background(if (isCurrent) Color(0xFF3E1818) else Color(0xFF1C1C1C))
                     .clickable { onSelectChapter(chapter) }
-                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
                     text = "${idx + 1}. ${chapter.title}",
                     color = Color.White,
-                    fontSize = 10.sp,
+                    fontSize = 12.sp,
                     fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-                Spacer(modifier = Modifier.width(6.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = "$chapPercent%",
                     color = if (isCurrent) Color(0xFFFF8A80) else Color(0xFF9E9E9E),
-                    fontSize = 9.5.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold
                 )
             }
-        }
-
-        Box(
-            modifier = Modifier
-                .padding(top = 4.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(Color(0xFF2C2C2C))
-                .clickable { onClose() }
-                .padding(horizontal = 14.dp, vertical = 5.dp)
-        ) {
-            Text("Chiudi", color = Color.White, fontSize = 10.sp)
         }
     }
 }
 
 @Composable
-fun SmallCircleButton(
+fun SmallControlButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     contentDesc: String,
     onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
-            .size(28.dp)
+            .size(34.dp)
             .clip(CircleShape)
             .background(Color(0xFF262626))
             .clickable { onClick() },
@@ -663,14 +948,11 @@ fun SmallCircleButton(
             imageVector = icon,
             contentDescription = contentDesc,
             tint = Color.White,
-            modifier = Modifier.size(15.dp)
+            modifier = Modifier.size(18.dp)
         )
     }
 }
 
-/**
- * Schermata Libreria con miniatura Copertina EPUB e Percentuale di Completamento affiancata.
- */
 @Composable
 fun LibraryScreen(
     onSelectFile: (File) -> Unit,
@@ -681,7 +963,6 @@ fun LibraryScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
-    val focusRequester = remember { FocusRequester() }
 
     var summaries by remember { mutableStateOf<List<BookSummary>>(emptyList()) }
     var isScanning by remember { mutableStateOf(true) }
@@ -702,7 +983,6 @@ fun LibraryScreen(
     }
 
     LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
         refreshLibrary()
     }
 
@@ -720,83 +1000,107 @@ fun LibraryScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .onRotaryScrollEvent { event ->
-                scope.launch { scrollState.scrollBy(event.verticalScrollPixels) }
-                true
-            }
-            .focusRequester(focusRequester)
-            .focusable()
             .verticalScroll(scrollState)
-            .padding(horizontal = 18.dp, vertical = 16.dp),
+            .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 44.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text(
-            text = "LIBRERIA SPRITZBOOKS",
-            color = Color(0xFFE53935),
-            fontSize = 10.5.sp,
-            fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center
-        )
-
-        // Pulsante Scansione / Permesso /sdcard/SpritzBooks
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .background(Color(0xFF263238))
-                .clickable {
-                    BookParser.getDedicatedFolders(context)
-                    hasAllFilesPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        Environment.isExternalStorageManager()
-                    } else true
-
-                    if (!hasAllFilesPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        runCatching {
-                            val intent = Intent(
-                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                Uri.parse("package:${context.packageName}")
-                            )
-                            context.startActivity(intent)
-                        }.onFailure {
-                            runCatching {
-                                context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                            }
-                        }
-                    }
-                    refreshLibrary()
-                }
-                .padding(vertical = 6.dp, horizontal = 8.dp),
-            contentAlignment = Alignment.Center
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            Text(
+                text = "LIBRERIA SPRITZBOOKS",
+                color = Color(0xFFE53935),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF3E1818))
+                    .clickable { onClose() }
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.Refresh,
-                    contentDescription = "Scansiona",
-                    tint = Color(0xFF64B5F6),
-                    modifier = Modifier.size(13.dp)
-                )
-                Text(
-                    text = if (hasAllFilesPermission) "Scansiona /SpritzBooks (${summaries.size})"
-                    else "Abilita Permesso /SpritzBooks",
-                    color = Color.White,
-                    fontSize = 9.5.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Text("Chiudi", color = Color.White, fontSize = 12.sp)
             }
         }
 
-        // Lista dei Libri con Copertina e Percentuale di Completamento
+        // Pulsante Scansione / Permesso /sdcard/SpritzBooks
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF263238))
+                    .clickable {
+                        BookParser.getDedicatedFolders(context)
+                        hasAllFilesPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            Environment.isExternalStorageManager()
+                        } else true
+
+                        if (!hasAllFilesPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            runCatching {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                context.startActivity(intent)
+                            }.onFailure {
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                }
+                            }
+                        }
+                        refreshLibrary()
+                    }
+                    .padding(vertical = 8.dp, horizontal = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Scansiona",
+                        tint = Color(0xFF64B5F6),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = if (hasAllFilesPermission) "Scansiona (${summaries.size})"
+                        else "Permesso /SpritzBooks",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF1E2A38))
+                    .clickable { onOpenSystemPicker() }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("Sfoglia File", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        // Lista dei Libri con Copertina EPUB e Percentuale di Completamento
         if (isScanning) {
-            Text("Lettura copertine...", color = Color.Gray, fontSize = 9.5.sp)
+            Text("Lettura copertine...", color = Color.Gray, fontSize = 12.sp)
         } else if (summaries.isEmpty()) {
             Text(
-                text = "Copia i tuoi .epub o .txt in /sdcard/SpritzBooks",
+                text = "Copia i tuoi .epub o .txt nella cartella /sdcard/SpritzBooks oppure usa Sfoglia File",
                 color = Color.Gray,
-                fontSize = 9.sp,
+                fontSize = 11.sp,
                 textAlign = TextAlign.Center
             )
         } else {
@@ -804,28 +1108,27 @@ fun LibraryScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
+                        .clip(RoundedCornerShape(12.dp))
                         .background(Color(0xFF1C1C1C))
                         .clickable { onSelectFile(item.file) }
-                        .padding(6.dp),
+                        .padding(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Copertina Libro EPUB (o icona libro se .txt / privo di copertina)
                     if (item.coverBitmap != null) {
                         Image(
                             bitmap = item.coverBitmap.asImageBitmap(),
                             contentDescription = item.displayTitle,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
-                                .size(width = 28.dp, height = 38.dp)
-                                .clip(RoundedCornerShape(4.dp))
+                                .size(width = 36.dp, height = 48.dp)
+                                .clip(RoundedCornerShape(6.dp))
                         )
                     } else {
                         Box(
                             modifier = Modifier
-                                .size(width = 28.dp, height = 38.dp)
-                                .clip(RoundedCornerShape(4.dp))
+                                .size(width = 36.dp, height = 48.dp)
+                                .clip(RoundedCornerShape(6.dp))
                                 .background(Color(0xFF332020)),
                             contentAlignment = Alignment.Center
                         ) {
@@ -833,20 +1136,19 @@ fun LibraryScreen(
                                 imageVector = Icons.Default.Book,
                                 contentDescription = null,
                                 tint = Color(0xFFE53935),
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(20.dp)
                             )
                         }
                     }
 
-                    // Titolo + Percentuale di completamento
                     Column(
                         modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                        verticalArrangement = Arrangement.spacedBy(3.dp)
                     ) {
                         Text(
                             text = item.displayTitle,
                             color = Color.White,
-                            fontSize = 10.sp,
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
@@ -854,7 +1156,7 @@ fun LibraryScreen(
                         Text(
                             text = "Completato: ${item.completionPercent}%",
                             color = if (item.completionPercent > 0) Color(0xFF81C784) else Color(0xFF9E9E9E),
-                            fontSize = 9.sp,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Medium
                         )
                     }
@@ -862,70 +1164,54 @@ fun LibraryScreen(
             }
         }
 
-        // Caricamento diretto in SpritzBooks via Wi-Fi
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .background(Color(0xFF1B3B2B))
-                .clickable {
-                    wifiUrl = if (wifiUrl == null) wifiServer.start(8080) else {
-                        wifiServer.stop()
-                        null
-                    }
-                }
-                .padding(vertical = 6.dp, horizontal = 8.dp),
-            contentAlignment = Alignment.Center
+        // Caricamento via Wi-Fi + Libro Demo
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Wifi,
-                    contentDescription = "Wi-Fi",
-                    tint = Color(0xFF81C784),
-                    modifier = Modifier.size(13.dp)
-                )
-                Text(
-                    text = wifiUrl ?: "Carica via Wi-Fi",
-                    color = Color.White,
-                    fontSize = 9.5.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1
-                )
-            }
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF1E2A38))
-                    .clickable { onOpenSystemPicker() }
-                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF1B3B2B))
+                    .clickable {
+                        wifiUrl = if (wifiUrl == null) wifiServer.start(8080) else {
+                            wifiServer.stop()
+                            null
+                        }
+                    }
+                    .padding(vertical = 8.dp, horizontal = 10.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text("Sfoglia", color = Color.White, fontSize = 9.5.sp)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Wifi,
+                        contentDescription = "Wi-Fi",
+                        tint = Color(0xFF81C784),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = wifiUrl ?: "Carica via Wi-Fi",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1
+                    )
+                }
             }
 
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
+                    .clip(RoundedCornerShape(10.dp))
                     .background(Color(0xFF2A2A2A))
                     .clickable { onSelectDemo() }
-                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text("Demo", color = Color.LightGray, fontSize = 9.5.sp)
-            }
-
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF3E1818))
-                    .clickable { onClose() }
-                    .padding(horizontal = 8.dp, vertical = 5.dp)
-            ) {
-                Text("Chiudi", color = Color.White, fontSize = 9.5.sp)
+                Text("Demo", color = Color.LightGray, fontSize = 11.sp)
             }
         }
     }
