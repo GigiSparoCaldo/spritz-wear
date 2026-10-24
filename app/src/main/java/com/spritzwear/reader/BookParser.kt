@@ -15,11 +15,13 @@ import java.net.ServerSocket
 import java.net.URLDecoder
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
+import kotlin.math.roundToLong
 
 data class SpritzWord(
     val prefix: String,
     val pivot: String,
-    val suffix: String
+    val suffix: String,
+    val delayMultiplier: Float
 )
 
 data class ChapterInfo(
@@ -47,7 +49,7 @@ object BookParser {
 
     fun toSpritzWord(rawWord: String): SpritzWord {
         val word = rawWord.trim()
-        if (word.isEmpty()) return SpritzWord("", "", "")
+        if (word.isEmpty()) return SpritzWord("", "", "", 1.0f)
 
         val cleanLength = word.trimEnd('.', ',', ';', ':', '!', '?', '"', '\'', ')', ']').length
         val pivotIndex = when {
@@ -63,7 +65,23 @@ object BookParser {
         val pivot = word.substring(pivotIndex, pivotIndex + 1)
         val suffix = if (pivotIndex + 1 < word.length) word.substring(pivotIndex + 1) else ""
 
-        return SpritzWord(prefix, pivot, suffix)
+        val lastChar = word.last()
+        var multiplier = when (lastChar) {
+            '.', '!', '?' -> 2.2f
+            ';', ':' -> 1.7f
+            ',' -> 1.45f
+            else -> 1.0f
+        }
+        if (cleanLength > 8) multiplier *= 1.3f
+        if (cleanLength > 14) multiplier *= 1.2f
+
+        return SpritzWord(prefix, pivot, suffix, multiplier)
+    }
+
+    fun calculateDelayMs(wpm: Int, multiplier: Float, rampFactor: Float = 1.0f): Long {
+        val effectiveWpm = (wpm * rampFactor).coerceAtLeast(60f)
+        val baseMs = 60_000f / effectiveWpm
+        return (baseMs * multiplier).roundToLong()
     }
 
     fun getDedicatedFolders(context: Context): List<File> {
@@ -110,9 +128,6 @@ object BookParser {
             .sortedBy { it.name.lowercase() }
     }
 
-    /**
-     * Costruisce i metadati della Libreria (Copertina ridimensionata + Percentuale di completamento).
-     */
     fun getBookSummaries(context: Context): List<BookSummary> {
         val prefs = context.getSharedPreferences("spritz_prefs", Context.MODE_PRIVATE)
         val files = scanBooksFolders(context)
@@ -122,7 +137,6 @@ object BookParser {
             val savedIdx = prefs.getInt("saved_index_$id", 0)
             var totalWords = prefs.getInt("saved_total_$id", 0)
 
-            // Se il libro non è mai stato aperto, esegue un pre-calcolo rapido del totale parole
             if (totalWords <= 0) {
                 runCatching {
                     val parsed = parseFile(context, file)
@@ -149,9 +163,6 @@ object BookParser {
         }
     }
 
-    /**
-     * Estrae l'immagine di copertina dall'EPUB e la salva in cache per non rallentare la lista.
-     */
     private fun extractEpubCover(context: Context, epubFile: File): Bitmap? {
         val cacheDir = File(context.cacheDir, "covers").apply { mkdirs() }
         val cachedCover = File(cacheDir, "${epubFile.name}.png")
@@ -185,7 +196,7 @@ object BookParser {
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(data, 0, data.size, opts)
             var sample = 1
-            while (opts.outWidth / sample > 96 || opts.outHeight / sample > 96) {
+            while (opts.outWidth / sample > 120 || opts.outHeight / sample > 120) {
                 sample *= 2
             }
             val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
@@ -377,26 +388,26 @@ object BookParser {
 
     fun getDemoBook(): BookItem {
         val ch1 = tokenize(
-            "HEADLINE delivers to Spritz, flashes right sul tuo OnePlus Watch 3! " +
-            "La densità di questa app è bloccata nativamente a 320 DPI anche se il sistema è a 240 DPI."
+            "HEADLINE delivers to Spritz, flashes right sulla FlexWindow esterna del tuo Galaxy Z Flip 7 e Z Flip 8! " +
+            "Puoi premere Play per la lettura automatica regolando i WPM con lo slider, oppure attivare la voce TTS."
         )
         val ch2 = tokenize(
-            "Ruota la corona per scorrere le parole al tuo ritmo. " +
-            "Tocca il titolo del capitolo in alto per aprire la lista completa dei capitoli e saltare dove vuoi!"
+            "Usa la barra touch orizzontale per scorrere le parole manualmente col pollice proprio come facevi con la corona. " +
+            "Tocca il titolo in alto per aprire la lista dei capitoli con la relativa percentuale."
         )
         val ch3 = tokenize(
-            "Nella schermata Libreria ora vedi la copertina di ogni libro EPUB " +
-            "con la percentuale di completamento sempre aggiornata."
+            "Nella schermata Libreria trovi tutti i file EPUB e TXT della cartella SpritzBooks " +
+            "con la miniatura della copertina e la percentuale di completamento."
         )
         val all = ch1 + ch2 + ch3
         return BookItem(
-            id = "demo_spritz",
-            title = "SPRITZ WEAR",
+            id = "demo_spritz_flip",
+            title = "SPRITZ FLIP",
             words = all,
             chapters = listOf(
-                ChapterInfo("1. Introduzione 320 DPI", 0, ch1.size - 1),
-                ChapterInfo("2. Controllo Corona", ch1.size, ch1.size + ch2.size - 1),
-                ChapterInfo("3. Copertine & Capitoli", ch1.size + ch2.size, all.lastIndex)
+                ChapterInfo("1. FlexWindow Z Flip 7/8", 0, ch1.size - 1),
+                ChapterInfo("2. Barra Touch & WPM", ch1.size, ch1.size + ch2.size - 1),
+                ChapterInfo("3. TTS & Copertine EPUB", ch1.size + ch2.size, all.lastIndex)
             )
         )
     }
@@ -478,11 +489,11 @@ class WifiBookServer(
             } else {
                 val html = """
                     <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-                    <title>SpritzWear Cartella SpritzBooks</title>
+                    <title>SpritzFlip Upload</title>
                     <style>body{background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:30px}
                     .box{max-width:360px;margin:auto;background:#1e1e1e;padding:24px;border-radius:16px}
                     button{background:#e53935;color:#fff;border:0;padding:12px 24px;border-radius:8px;font-size:16px;margin-top:16px;cursor:pointer}</style>
-                    </head><body><div class="box"><h2>SpritzWear Watch 3</h2>
+                    </head><body><div class="box"><h2>SpritzFlip Z Flip 7/8</h2>
                     <p>Invia un file <b>.epub</b> o <b>.txt</b> direttamente nella cartella <b>SpritzBooks</b>:</p>
                     <input type="file" id="f" accept=".epub,.txt"><br>
                     <button onclick="up()">Carica in SpritzBooks</button>
